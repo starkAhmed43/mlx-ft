@@ -1,0 +1,37 @@
+model: Qwen/Qwen3-0.6B-MLX-4bit
+model_revision: 173234aa840d113125e9f2271100ddbaf16c9620
+fine_tune_type: lora
+train: true
+mask_prompt: true
+seed: 42
+num_layers: 8
+batch_size: 1
+grad_accumulation_steps: 8
+iters: 128
+max_seq_length: 512
+optimizer: adamw
+learning_rate: 5.0e-5
+steps_per_report: 8
+steps_per_eval: 128
+val_batches: -1
+save_every: 129
+grad_checkpoint: false
+lora_parameters:
+  keys:
+    - self_attn.q_proj
+    - self_attn.v_proj
+  rank: 8
+  scale: 20.0
+  dropout: 0.0
+dataset:
+  name: Salesforce/xlam-function-calling-60k
+  revision: 26d14ebfe18b1f7b524bd39b404b50af5dc97866
+  split: train
+  version: smoke
+rendering:
+  enable_thinking: false
+  mask_prompt: true
+  max_seq_length: 512
+provenance:
+  label: pipeline validation
+  seed: 42

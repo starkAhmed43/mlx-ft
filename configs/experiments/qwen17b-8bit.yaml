@@ -1,0 +1,8 @@
+model: Qwen/Qwen3-1.7B-MLX-8bit
+model_revision: 95400cbada1bef81d2c4fb6f9d2b10aa27f1f1a0
+dataset:
+  version: nested_1k
+training:
+  lora_parameters:
+    rank: 8
+    scale: 20.0
