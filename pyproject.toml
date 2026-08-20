@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-ftlab"
+version = "0.1.0"
+description = "A learning-focused MLX function-calling fine-tuning lab."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "numpy>=2.2,<3",
+  "psutil>=6,<8",
+  "pydantic>=2.10,<3",
+  "pyyaml>=6.0,<7",
+  "jsonschema==4.26.0",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+apple = [
+  "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-lm[train]==0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+data = [
+  "datasets==5.0.1",
+  "transformers==5.14.1",
+]
+tracking = ["wandb==0.28.1"]
+reporting = ["matplotlib>=3.9,<4", "pandas>=2.2,<3"]
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+ftlab = "ftlab.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["real: requires pinned Hugging Face and MLX assets"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+packages = ["ftlab"]
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
