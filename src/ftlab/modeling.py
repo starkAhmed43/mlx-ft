@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,21 @@ from .exceptions import ExternalDependencyError, FtlabError
 from .huggingface import resolve_snapshot
 
 EXPECTED_TRAINABLE_PARAMETERS = 327680
+
+
+@dataclass(frozen=True)
+class PredictionMeasurement:
+    """One measured inference output, excluding caller-side prompt rendering."""
+
+    prediction: str
+    latency_seconds: float
+    prompt_tokens: int
+    output_tokens: int
+    prompt_processing_tokens_per_second: float | None
+    generation_tokens_per_second: float | None
+    allocator_before_bytes: int | None
+    allocator_peak_bytes: int | None
+    allocator_after_bytes: int | None
 
 
 def _mlx_modules() -> tuple[Any, Any, Any]:
@@ -27,6 +45,19 @@ def _mlx_modules() -> tuple[Any, Any, Any]:
             "MLX and MLX-LM are required; install the apple extra on Apple Silicon"
         ) from exc
     return mx, mlx_lm, optimizers
+
+
+def _allocator_memory(mx: Any) -> tuple[int | None, int | None]:
+    def read(name: str) -> int | None:
+        getter = getattr(mx, name, None)
+        if not callable(getter):
+            return None
+        try:
+            return int(getter())
+        except TypeError, ValueError:
+            return None
+
+    return read("get_active_memory"), read("get_peak_memory")
 
 
 def load_model(
@@ -452,13 +483,22 @@ def run_training(
         or not (adapter / "adapters.safetensors").stat().st_size
     ):
         raise FtlabError("MLX-LM did not produce a non-empty final adapter")
+    adapter_file = adapter / "adapters.safetensors"
+    adapter_bytes = adapter_file.stat().st_size
+    tokenizer_hash = hashlib.sha256(
+        json.dumps(tokenizer_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return {
         "microbatches": config.iters,
         "optimizer_updates": config.iters // config.grad_accumulation_steps,
         "prompt_tokens": prompt_tokens,
         "target_tokens": target_tokens,
         "tokenizer_identity": tokenizer_identity,
+        "tokenizer_hash": tokenizer_hash,
         "adapter": str(adapter),
+        "adapter_bytes": adapter_bytes,
+        "checkpoint_bytes": None,
+        "adapter_hash": hashlib.sha256(adapter_file.read_bytes()).hexdigest(),
         "manifest": manifest,
         "training_metrics": callback.values,
     }
@@ -479,4 +519,56 @@ def generate_predictions(
         except Exception as exc:
             raise FtlabError(f"MLX-LM generation failed: {exc}") from exc
         outputs.append(result if isinstance(result, str) else str(result))
+    return outputs
+
+
+def generate_predictions_measured(
+    model: Any, tokenizer: Any, prompts: Iterable[str], *, max_tokens: int = 128
+) -> list[PredictionMeasurement]:
+    """Generate with MLX-LM stream telemetry for separate prefill and decode rates."""
+    mx, mlx_lm, _ = _mlx_modules()
+    stream_generate = getattr(mlx_lm, "stream_generate", None)
+    if not callable(stream_generate):
+        raise ExternalDependencyError("MLX-LM streaming generation API is unavailable")
+    outputs: list[PredictionMeasurement] = []
+    for prompt in prompts:
+        before_active, before_peak = _allocator_memory(mx)
+        started = time.perf_counter()
+        segments: list[str] = []
+        last: Any = None
+        try:
+            for response in stream_generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens):
+                segments.append(str(getattr(response, "text", "")))
+                last = response
+        except Exception as exc:
+            raise FtlabError(f"MLX-LM generation failed: {exc}") from exc
+        if last is None:
+            raise FtlabError("MLX-LM streaming generation returned no response")
+        after_active, after_peak = _allocator_memory(mx)
+        output = "".join(segments)
+        prompt_tokens = int(getattr(last, "prompt_tokens", 0))
+        generated = int(getattr(last, "generation_tokens", 0))
+        try:
+            output_tokens = len(tokenizer.encode(output, add_special_tokens=False))
+        except AttributeError, TypeError, ValueError:
+            output_tokens = generated
+        prompt_tps = getattr(last, "prompt_tps", None)
+        generation_tps = getattr(last, "generation_tps", None)
+        outputs.append(
+            PredictionMeasurement(
+                prediction=output,
+                latency_seconds=time.perf_counter() - started,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                prompt_processing_tokens_per_second=(
+                    float(prompt_tps) if isinstance(prompt_tps, Real) else None
+                ),
+                generation_tokens_per_second=(
+                    float(generation_tps) if isinstance(generation_tps, Real) else None
+                ),
+                allocator_before_bytes=before_active,
+                allocator_peak_bytes=after_peak if after_peak is not None else before_peak,
+                allocator_after_bytes=after_active,
+            )
+        )
     return outputs

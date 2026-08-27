@@ -9,7 +9,13 @@ import pytest
 
 from ftlab.config import TrainingConfig
 from ftlab.exceptions import FtlabError
-from ftlab.modeling import assert_adapter_layout, run_training, tokenize_prompt_completion
+from ftlab.modeling import (
+    PredictionMeasurement,
+    assert_adapter_layout,
+    generate_predictions_measured,
+    run_training,
+    tokenize_prompt_completion,
+)
 
 
 def _model(extra: bool = False):
@@ -69,6 +75,134 @@ def test_token_preprocessing_has_exact_offset_and_limit() -> None:
     assert offset == len(b"prompt")
     with pytest.raises(FtlabError, match="exceeding max_seq_length"):
         tokenize_prompt_completion("prompt", "completion", Tokenizer(), max_seq_length=5)
+
+
+def test_measured_generation_separates_prefill_decode_and_allocator(monkeypatch) -> None:
+    class Mx:
+        active = [10, 13]
+        peak = [11, 17]
+
+        @classmethod
+        def get_active_memory(cls):
+            return cls.active.pop(0)
+
+        @classmethod
+        def get_peak_memory(cls):
+            return cls.peak.pop(0)
+
+    class Tokenizer:
+        @staticmethod
+        def encode(value, add_special_tokens=False):
+            assert add_special_tokens is False
+            return list(value)
+
+    class Response:
+        def __init__(self, text, final=False):
+            self.text = text
+            self.prompt_tokens = 4
+            self.generation_tokens = 2
+            self.prompt_tps = 40.0
+            self.generation_tps = 20.0
+            self.finish_reason = "stop" if final else None
+
+    class MlxLm:
+        @staticmethod
+        def stream_generate(model, tokenizer, *, prompt, max_tokens):
+            assert prompt == "test"
+            assert max_tokens == 8
+            yield Response("hi")
+            yield Response("!", final=True)
+
+    monkeypatch.setattr("ftlab.modeling._mlx_modules", lambda: (Mx, MlxLm, object()))
+    measured = generate_predictions_measured(object(), Tokenizer(), ["test"], max_tokens=8)
+    assert len(measured) == 1
+    item = measured[0]
+    assert item.prediction == "hi!"
+    assert item.prompt_tokens == 4
+    assert item.output_tokens == 3
+    assert item.prompt_processing_tokens_per_second == 40.0
+    assert item.generation_tokens_per_second == 20.0
+    assert (item.allocator_before_bytes, item.allocator_peak_bytes, item.allocator_after_bytes) == (
+        10,
+        17,
+        13,
+    )
+
+
+def test_evaluation_predictions_store_recomputable_gold_without_prompt(
+    tmp_path, monkeypatch
+) -> None:
+    from ftlab.worker import run_evaluation_request
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "splits": {
+                    "test": [
+                        {
+                            "id": "stable-id",
+                            "query": "Private prompt text must not be persisted.",
+                            "tools": [
+                                {
+                                    "name": "weather",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"city": {"type": "string"}},
+                                        "required": ["city"],
+                                    },
+                                }
+                            ],
+                            "answer": {"name": "weather", "arguments": {"city": "Paris"}},
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Tokenizer:
+        @staticmethod
+        def encode(value, add_special_tokens=False):
+            return list(value)
+
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            prompt = "rendered private prompt"
+            if kwargs["add_generation_prompt"]:
+                return prompt
+            return prompt + '<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>'
+
+    prediction = '<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>'
+    monkeypatch.setattr(
+        "ftlab.modeling.load_model", lambda *args, **kwargs: (object(), Tokenizer())
+    )
+    monkeypatch.setattr("ftlab.modeling.generate_predictions", lambda *args, **kwargs: [prediction])
+    monkeypatch.setattr(
+        "ftlab.modeling.generate_predictions_measured",
+        lambda *args, **kwargs: [PredictionMeasurement(prediction, 0.1, 5, 8, 50.0, 80.0, 1, 3, 2)],
+    )
+    predictions_path = tmp_path / "predictions.jsonl"
+    run_evaluation_request(
+        {
+            "model": "fixture",
+            "model_revision": "fixture",
+            "manifest": str(manifest),
+            "predictions_path": str(predictions_path),
+            "evaluation_path": str(tmp_path / "evaluation.json"),
+        }
+    )
+    row = json.loads(predictions_path.read_text(encoding="utf-8"))
+    assert row["source_id"] == "stable-id"
+    assert row["record"]["answer"] == {"name": "weather", "arguments": {"city": "Paris"}}
+    assert row["record"]["tools"][0]["name"] == "weather"
+    assert row["diagnostics"]["truncated"] is False
+    assert set(row["hashes"]) == {"prompt", "record"}
+    serialized = json.dumps(row)
+    assert "Private prompt text" not in serialized
+    assert "rendered private prompt" not in serialized
+    assert str(tmp_path) not in serialized
 
 
 def test_training_invocation_preserves_smoke_contract(tmp_path, monkeypatch) -> None:
@@ -219,6 +353,9 @@ def test_training_invocation_preserves_smoke_contract(tmp_path, monkeypatch) -> 
     assert args.steps_per_save == 129
     assert result["microbatches"] == 128
     assert result["optimizer_updates"] == 16
+    assert result["adapter_bytes"] == len(b"adapter")
+    assert result["adapter_hash"]
+    assert result["tokenizer_hash"]
     with pytest.raises(FtlabError, match="training metric train_loss is not finite"):
         run_training(
             config,

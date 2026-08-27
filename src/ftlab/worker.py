@@ -17,6 +17,7 @@ def bfcl_row_inputs(row: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     from .data import normalize_schema
 
     question: Any = row.get("query", row.get("question"))
+    query: Any
     if isinstance(question, str):
         query = question
     else:
@@ -71,7 +72,15 @@ def _allocator_peak() -> int | None:
 
 def _write_result(request: dict[str, Any], result: dict[str, Any]) -> None:
     path = Path(request["result_path"])
-    path.write_text(json.dumps(result, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    # Result files are persisted run artifacts. Do not leak request paths or
+    # exception text that can contain local paths or credentials.
+    from .artifacts import sanitize_persisted_value
+
+    root = path.parent.parent.parent
+    safe_result = sanitize_persisted_value(result, root)
+    path.write_text(
+        json.dumps(safe_result, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
+    )
 
 
 def run_training_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -97,7 +106,7 @@ def run_training_request(request: dict[str, Any]) -> dict[str, Any]:
 def run_evaluation_request(request: dict[str, Any]) -> dict[str, Any]:
     from .data import normalize_records
     from .metrics import evaluate_predictions
-    from .modeling import generate_predictions, load_model
+    from .modeling import generate_predictions, generate_predictions_measured, load_model
     from .rendering import TOOL_END, TOOL_START, render_record, tokenizer_fingerprint
 
     payload = json.loads(Path(request["manifest"]).read_text(encoding="utf-8"))
@@ -122,7 +131,9 @@ def run_evaluation_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(decoding, dict):
         decoding = {}
     max_tokens = int(decoding.get("max_tokens", request.get("max_tokens", 128)))
+    render_started = time.perf_counter()
     rendered = [render_record(record, tokenizer) for record in records]
+    render_time = time.perf_counter() - render_started
     warmup_prompts = (
         [rendered[index % len(rendered)].prompt for index in range(8)] if rendered else []
     )
@@ -134,15 +145,15 @@ def run_evaluation_request(request: dict[str, Any]) -> dict[str, Any]:
     diagnostics: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
     predictions: list[str] = []
-    for item in rendered:
-        started = time.perf_counter()
-        value = generate_predictions(
+    for index, item in enumerate(rendered):
+        measured = generate_predictions_measured(
             model, tokenizer, [item.prompt], max_tokens=max_tokens
         )[0]
-        latencies.append(time.perf_counter() - started)
+        value = measured.prediction
+        latencies.append(measured.latency_seconds)
         predictions.append(value)
-        prompt_count = len(item.prompt_tokens)
-        generated_count = len(tokenizer.encode(value, add_special_tokens=False))
+        prompt_count = measured.prompt_tokens
+        generated_count = measured.output_tokens
         truncated = (
             generated_count >= max_tokens
             or (TOOL_START in value and TOOL_END not in value)
@@ -157,18 +168,37 @@ def run_evaluation_request(request: dict[str, Any]) -> dict[str, Any]:
                 "truncated": truncated,
             }
         )
+        gold_record = records[index].as_dict()
+        # The query is the rendered prompt's source text. Metrics require the
+        # tool schema and gold answer, not the prompt itself.
+        gold_record.pop("query", None)
+        gold_hash = hashlib.sha256(
+            json.dumps(gold_record, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         prediction_rows.append(
             {
-                "source_id": records[len(prediction_rows)].source_id,
+                "source_id": records[index].source_id,
+                "record": gold_record,
                 "prediction": value,
                 "prompt_hash": hashlib.sha256(item.prompt.encode("utf-8")).hexdigest(),
+                "record_hash": gold_hash,
+                "hashes": {
+                    "prompt": hashlib.sha256(item.prompt.encode("utf-8")).hexdigest(),
+                    "record": gold_hash,
+                },
                 "decoding": decoding or {"max_tokens": max_tokens},
                 "prompt_tokens": prompt_count,
                 "completion_tokens": generated_count,
                 "latency_seconds": latencies[-1],
+                "prompt_processing_tokens_per_second": measured.prompt_processing_tokens_per_second,
+                "generation_tokens_per_second": measured.generation_tokens_per_second,
+                "allocator_before_bytes": measured.allocator_before_bytes,
+                "allocator_peak_bytes": measured.allocator_peak_bytes,
+                "allocator_after_bytes": measured.allocator_after_bytes,
                 "generated_tokens": generated_count,
                 "max_generation_tokens": max_tokens,
                 "generation_truncated": truncated,
+                "diagnostics": diagnostics[-1],
             }
         )
     evaluation = evaluate_predictions(
@@ -198,20 +228,53 @@ def run_evaluation_request(request: dict[str, Any]) -> dict[str, Any]:
         "first_quartile": statistics.fmean(rates[:quarter]) if rates else 0.0,
         "last_quartile": statistics.fmean(rates[-quarter:]) if rates else 0.0,
     }
+    generation_throughput = sum(completion_tokens) / sum(latencies) if sum(latencies) else 0.0
+    prompt_rates = [
+        row["prompt_processing_tokens_per_second"]
+        for row in prediction_rows
+        if row["prompt_processing_tokens_per_second"] is not None
+    ]
+    generation_rates = [
+        row["generation_tokens_per_second"]
+        for row in prediction_rows
+        if row["generation_tokens_per_second"] is not None
+    ]
+    allocator_values = {
+        key: [row[key] for row in prediction_rows if row[key] is not None]
+        for key in ("allocator_before_bytes", "allocator_peak_bytes", "allocator_after_bytes")
+    }
     return {
         "evaluation": evaluation,
         "count": len(predictions),
         "mlx_allocator_peak_bytes": peak,
         "load_time_seconds": load_time,
+        "cold_load_seconds": load_time,
         "warmup_steps_excluded": 8,
         "latency_p50": percentile(0.50),
         "latency_p95": percentile(0.95),
         "latency_p99": percentile(0.99),
         "prompt_tokens": sum(prompt_tokens),
         "completion_tokens": sum(completion_tokens),
-        "throughput_tokens_per_second": sum(completion_tokens) / sum(latencies)
-        if sum(latencies)
-        else 0.0,
+        "throughput_tokens_per_second": generation_throughput,
+        "generation_throughput_tokens_per_second": generation_throughput,
+        "prompt_processing_tokens_per_second": statistics.fmean(prompt_rates)
+        if prompt_rates
+        else None,
+        "generation_tokens_per_second": statistics.fmean(generation_rates)
+        if generation_rates
+        else None,
+        "prompt_rendering_seconds": render_time,
+        "allocator_memory_bytes": {
+            "before": allocator_values["allocator_before_bytes"][0]
+            if allocator_values["allocator_before_bytes"]
+            else None,
+            "peak": max(allocator_values["allocator_peak_bytes"])
+            if allocator_values["allocator_peak_bytes"]
+            else None,
+            "after": allocator_values["allocator_after_bytes"][-1]
+            if allocator_values["allocator_after_bytes"]
+            else None,
+        },
         "throughput_quartiles": throughput,
         "tokenizer_identity": tokenizer_identity,
     }
@@ -262,9 +325,7 @@ def run_robustness_request(request: dict[str, Any]) -> dict[str, Any]:
     for case in cases:
         tools = list(case.tools) if hasattr(case, "tools") else []
         prompt = render_tools_prompt(tools, case.query, tokenizer)
-        value = generate_predictions(
-            model, tokenizer, [prompt], max_tokens=max_tokens
-        )[0]
+        value = generate_predictions(model, tokenizer, [prompt], max_tokens=max_tokens)[0]
         values.append(value)
         rows.append(
             {

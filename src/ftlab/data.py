@@ -9,7 +9,7 @@ import os
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -19,13 +19,15 @@ from .exceptions import ExternalDependencyError
 
 DATASET_ID = "Salesforce/xlam-function-calling-60k"
 DATASET_REVISION = "26d14ebfe18b1f7b524bd39b404b50af5dc97866"
-DATA_FILTER_VERSION = 1
-SPLIT_VERSION = 1
+DATA_FILTER_VERSION = 2
+SPLIT_VERSION = 2
+DATASET_MANIFEST_VERSION = 2
 
 # One immutable allocation plan is shared by all published dataset versions.
 NESTED_TRAIN_TARGETS = {"smoke": 128, "day1": 2000, "core": 10000, "full": 20000}
 LOCKED_VALIDATION_SIZE = 750
 LOCKED_TEST_SIZE = 1000
+SCHEMA_OOD_TEST_SIZE = 1000
 
 
 def canonical_json(value: Any) -> str:
@@ -687,6 +689,36 @@ def _without_locked_components(
     ]
 
 
+def _without_locked_schema_components(
+    records: Sequence[AcceptedRecord], locked: Sequence[AcceptedRecord]
+) -> list[AcceptedRecord]:
+    """Remove records that share an API prefix or schema with a locked OOD split."""
+    prefixes = set().union(*(item.candidate_prefixes for item in locked)) if locked else set()
+    fingerprints = (
+        set().union(*(item.candidate_fingerprints for item in locked)) if locked else set()
+    )
+    return [
+        item
+        for item in records
+        if not (item.candidate_prefixes & prefixes or item.candidate_fingerprints & fingerprints)
+    ]
+
+
+def _allocation_error(
+    stage: str,
+    *,
+    required: int,
+    available: int,
+    short_eligible: int,
+    long_eligible: int,
+) -> ValueError:
+    return ValueError(
+        f"cannot allocate {stage}: require {required}, have {available}; "
+        f"eligible_512={short_eligible}, eligible_2048={long_eligible}. "
+        "Duplicate and schema-OOD exclusions are applied before allocation."
+    )
+
+
 def _nested_subset(
     records: Sequence[AcceptedRecord], target: int, *, seed: int
 ) -> list[AcceptedRecord]:
@@ -703,65 +735,237 @@ def _nested_subset(
 
 
 def build_nested_allocation(
-    records: Sequence[AcceptedRecord], *, seed: int = 42
+    records: Sequence[AcceptedRecord],
+    *,
+    long_records: Sequence[AcceptedRecord] | None = None,
+    require_full: bool = True,
+    seed: int = 42,
 ) -> dict[str, dict[str, list[AcceptedRecord]]]:
-    """Build the frozen train nesting and shared validation/test locks.
+    """Build frozen 512-token data and extend only the 20k endpoint to 2048.
 
-    Validation and test are selected once from the complete accepted pool.
-    Every training size is a deterministic subset of the full training pool.
+    ``records`` is the fully normalized pool.  Records at or below 512 tokens
+    supply Schema-OOD, IID validation/test, and every training set through
+    10k.  ``long_records`` can provide a separately rendered <=2048 pool; when
+    omitted it is derived from ``records``. Set ``require_full`` false to
+    allocate only the short versions when the 20k endpoint is not requested.
     """
-    locked = stratified_split_records(
-        records,
-        {"validation": LOCKED_VALIDATION_SIZE, "test": LOCKED_TEST_SIZE},
-        seed=seed,
+    short, _ = context_eligible_records(records, 512)
+    long, _ = context_eligible_records(long_records or records, 2048)
+    if len(short) < SCHEMA_OOD_TEST_SIZE:
+        raise _allocation_error(
+            "schema-OOD test",
+            required=SCHEMA_OOD_TEST_SIZE,
+            available=len(short),
+            short_eligible=len(short),
+            long_eligible=len(long),
+        )
+    try:
+        schema_ood = allocate_schema_ood_test(short, [], target=SCHEMA_OOD_TEST_SIZE, seed=seed)
+    except ValueError as exc:
+        raise _allocation_error(
+            "schema-OOD test",
+            required=SCHEMA_OOD_TEST_SIZE,
+            available=0,
+            short_eligible=len(short),
+            long_eligible=len(long),
+        ) from exc
+
+    # The OOD test is reserved first.  Every later IID split excludes both its
+    # duplicate components and every shared API-prefix/schema component.
+    iid_pool = _without_locked_schema_components(
+        _without_locked_components(short, schema_ood), schema_ood
     )
-    locked_values = [*locked["validation"], *locked["test"]]
-    candidates = _without_locked_components(records, locked_values)
-    full_train = stratified_split_records(
-        candidates, {"train": NESTED_TRAIN_TARGETS["full"]}, seed=seed
-    )["train"]
-    train_versions = {
-        name: _nested_subset(full_train, target, seed=seed)
-        for name, target in NESTED_TRAIN_TARGETS.items()
+    iid_required = LOCKED_VALIDATION_SIZE + LOCKED_TEST_SIZE
+    if len(iid_pool) < iid_required:
+        raise _allocation_error(
+            "IID validation/test",
+            required=iid_required,
+            available=len(iid_pool),
+            short_eligible=len(short),
+            long_eligible=len(long),
+        )
+    try:
+        locked = stratified_split_records(
+            iid_pool,
+            {"validation": LOCKED_VALIDATION_SIZE, "test": LOCKED_TEST_SIZE},
+            seed=seed,
+        )
+    except ValueError as exc:
+        raise _allocation_error(
+            "IID validation/test",
+            required=iid_required,
+            available=len(iid_pool),
+            short_eligible=len(short),
+            long_eligible=len(long),
+        ) from exc
+    iid_locked = [*locked["validation"], *locked["test"]]
+    short_train_pool = _without_locked_components(iid_pool, iid_locked)
+    try:
+        core_train = _nested_subset(short_train_pool, NESTED_TRAIN_TARGETS["core"], seed=seed)
+    except ValueError as exc:
+        raise _allocation_error(
+            "512-token core train",
+            required=NESTED_TRAIN_TARGETS["core"],
+            available=len(short_train_pool),
+            short_eligible=len(short),
+            long_eligible=len(long),
+        ) from exc
+
+    short_trains = {
+        "smoke": _nested_subset(core_train, NESTED_TRAIN_TARGETS["smoke"], seed=seed),
+        "day1": _nested_subset(core_train, NESTED_TRAIN_TARGETS["day1"], seed=seed),
+        "core": core_train,
     }
-    # Smoke/day1 use smaller views of the immutable locks. The core locks are
-    # never independently reallocated for an alias.
     validation_views = {
-        "full": locked["validation"],
-        "core": locked["validation"],
-        "day1": _nested_subset(locked["validation"], 250, seed=seed),
         "smoke": _nested_subset(locked["validation"], 32, seed=seed),
+        "day1": _nested_subset(locked["validation"], 250, seed=seed),
+        "core": locked["validation"],
     }
     test_views = {
-        "full": locked["test"],
-        "core": locked["test"],
-        "day1": _nested_subset(locked["test"], 250, seed=seed),
         "smoke": _nested_subset(locked["test"], 64, seed=seed),
+        "day1": _nested_subset(locked["test"], 250, seed=seed),
+        "core": locked["test"],
     }
-    output: dict[str, dict[str, list[AcceptedRecord]]] = {}
-    for name in NESTED_TRAIN_TARGETS:
-        output[name] = {
-            "train": train_versions[name],
+    output: dict[str, dict[str, list[AcceptedRecord]]] = {
+        name: {
+            "train": short_trains[name],
             "validation": validation_views[name],
             "test": test_views[name],
         }
-    alias_targets = {
-        "nested_1k": 1000,
-        "nested-1k": 1000,
-        "nested_5k": 5000,
-        "nested-5k": 5000,
-        "nested_10k": 10000,
-        "nested-10k": 10000,
-        "nested_20k": 20000,
-        "nested-20k": 20000,
+        for name in short_trains
     }
-    for alias, target_size in alias_targets.items():
+    output["schema_ood"] = {"train": [], "validation": [], "test": schema_ood}
+    for alias, target in (("nested_1k", 1000), ("nested_5k", 5000), ("nested_10k", 10000)):
         output[alias] = {
-            "train": _nested_subset(full_train, target_size, seed=seed),
+            "train": _nested_subset(core_train, target, seed=seed),
+            "validation": locked["validation"],
+            "test": locked["test"],
+        }
+        output[alias.replace("_", "-")] = output[alias]
+    if not require_full:
+        return output
+
+    # Full may use the longer tier, but it must retain the exact 10k core set.
+    long_pool = _without_locked_schema_components(
+        _without_locked_components(long, [*schema_ood, *iid_locked, *core_train]), schema_ood
+    )
+    extension_target = NESTED_TRAIN_TARGETS["full"] - len(core_train)
+    try:
+        extension = _nested_subset(long_pool, extension_target, seed=seed)
+    except ValueError as exc:
+        raise _allocation_error(
+            "2048-token full train extension",
+            required=extension_target,
+            available=len(long_pool),
+            short_eligible=len(short),
+            long_eligible=len(long),
+        ) from exc
+    full_train = [*core_train, *extension]
+    output["full"] = {
+        "train": full_train,
+        "validation": locked["validation"],
+        "test": locked["test"],
+    }
+    for alias in ("nested_20k", "nested-20k"):
+        output[alias] = {
+            "train": full_train,
             "validation": locked["validation"],
             "test": locked["test"],
         }
     return output
+
+
+def _split_id_hash(records: Sequence[AcceptedRecord]) -> str:
+    return hashlib.sha256("\n".join(item.source_id for item in records).encode()).hexdigest()
+
+
+def dataset_manifest_v2(
+    *,
+    version: str,
+    allocation: Mapping[str, Sequence[AcceptedRecord]],
+    eligibility_counts: Mapping[str, int],
+    source_descriptors: Sequence[Mapping[str, str]],
+    prompt_contract_version: int,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Return a portable dataset manifest without records or machine paths."""
+    if prompt_contract_version < 1:
+        raise ValueError("prompt_contract_version must be positive")
+    allowed_source_keys = {"dataset", "revision", "kind", "sha256"}
+    sources: list[dict[str, str]] = []
+    for descriptor in source_descriptors:
+        if set(descriptor) - allowed_source_keys:
+            raise ValueError(
+                "source descriptors may contain only dataset, revision, kind, and sha256"
+            )
+        clean = {key: str(value) for key, value in sorted(descriptor.items())}
+        if any(os.path.isabs(value) for value in clean.values()):
+            raise ValueError("source descriptors must not contain absolute paths")
+        sources.append(clean)
+    if set(eligibility_counts) != {"eligible_512", "eligible_2048"}:
+        raise ValueError("eligibility_counts must contain eligible_512 and eligible_2048")
+    if any(value < 0 for value in eligibility_counts.values()):
+        raise ValueError("eligibility counts must be non-negative")
+    splits = {
+        name: {"count": len(records), "id_hash": _split_id_hash(records)}
+        for name, records in sorted(allocation.items())
+    }
+    payload: dict[str, Any] = {
+        "dataset_manifest_version": DATASET_MANIFEST_VERSION,
+        "version": version,
+        "seed": seed,
+        "filter_version": DATA_FILTER_VERSION,
+        "split_version": SPLIT_VERSION,
+        "prompt_contract_version": prompt_contract_version,
+        "token_tiers": {"short": 512, "long": 2048},
+        "eligibility_counts": dict(sorted(eligibility_counts.items())),
+        "sources": sorted(sources, key=canonical_json),
+        "split_locks": splits,
+    }
+    payload["content_sha256"] = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+    return payload
+
+
+def validate_dataset_manifest_v2(manifest: Mapping[str, Any]) -> None:
+    """Validate the sanitized, content-addressed dataset-manifest contract."""
+    if manifest.get("dataset_manifest_version") != DATASET_MANIFEST_VERSION:
+        raise ValueError("unsupported dataset manifest version")
+    required = {
+        "version",
+        "seed",
+        "filter_version",
+        "split_version",
+        "prompt_contract_version",
+        "token_tiers",
+        "eligibility_counts",
+        "sources",
+        "split_locks",
+        "content_sha256",
+    }
+    missing = sorted(required - set(manifest))
+    if missing:
+        raise ValueError(f"dataset manifest is missing required fields: {', '.join(missing)}")
+    if manifest["token_tiers"] != {"short": 512, "long": 2048}:
+        raise ValueError("dataset manifest token tiers do not match the locked contract")
+    counts = manifest["eligibility_counts"]
+    if not isinstance(counts, Mapping) or set(counts) != {"eligible_512", "eligible_2048"}:
+        raise ValueError("dataset manifest eligibility counts are invalid")
+    if not all(isinstance(value, int) and value >= 0 for value in counts.values()):
+        raise ValueError("dataset manifest eligibility counts are invalid")
+    locks = manifest["split_locks"]
+    if not isinstance(locks, Mapping) or not locks:
+        raise ValueError("dataset manifest split locks are invalid")
+    for split in locks.values():
+        if not isinstance(split, Mapping) or not isinstance(split.get("count"), int):
+            raise ValueError("dataset manifest split lock count is invalid")
+        digest = split.get("id_hash")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("dataset manifest split lock hash is invalid")
+    payload = dict(manifest)
+    digest = payload.pop("content_sha256")
+    expected = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+    if digest != expected:
+        raise ValueError("dataset manifest content hash does not match")
 
 
 def tool_count_stratum(record: AcceptedRecord) -> str:

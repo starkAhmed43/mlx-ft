@@ -191,6 +191,21 @@ def evaluate_robustness(predictions: list[str] | dict[str, str]) -> dict[str, An
             int(parsed.valid and parsed.name == case.expected_name)
         )
     no_call_values = [values.get(case.case_id, "") for case in no_calls]
+    no_call_failures: list[dict[str, str]] = []
+    parser_diagnostics: dict[str, int] = {}
+    for no_call_case, value in zip(no_calls, no_call_values):
+        if TOOL_START not in value and TOOL_END not in value:
+            continue
+        parsed = parse_prediction(value, [])
+        diagnostic = parsed.error.category if parsed.error is not None else "valid"
+        parser_diagnostics[diagnostic] = parser_diagnostics.get(diagnostic, 0) + 1
+        no_call_failures.append(
+            {
+                "case_id": no_call_case.case_id,
+                "error_category": "should_not_call_tool",
+                "parser_diagnostic": diagnostic,
+            }
+        )
     return {
         "call_count": len(calls),
         "call_success": successes / len(calls),
@@ -202,5 +217,10 @@ def evaluate_robustness(predictions: list[str] | dict[str, str]) -> dict[str, An
             int(TOOL_START not in value and TOOL_END not in value) for value in no_call_values
         )
         / len(no_call_values),
+        "no_call_error_categories": {
+            "should_not_call_tool": len(no_call_failures),
+        },
+        "no_call_failures": no_call_failures,
+        "no_call_parser_diagnostics": parser_diagnostics,
         "case_hash": hashlib.sha256("\n".join(case.case_id for case in cases).encode()).hexdigest(),
     }

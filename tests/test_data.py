@@ -3,17 +3,22 @@ from __future__ import annotations
 import pytest
 
 from ftlab.data import (
+    DATA_FILTER_VERSION,
+    SPLIT_VERSION,
     AcceptedRecord,
     Rejection,
     allocate_schema_ood_test,
     audit_records,
+    build_nested_allocation,
     context_eligible_records,
+    dataset_manifest_v2,
     normalize_record,
     normalize_schema,
     normalized_query,
     schema_fingerprint,
     split_records,
     stratified_split_records,
+    validate_dataset_manifest_v2,
 )
 
 
@@ -344,3 +349,105 @@ def test_schema_ood_discards_transitive_component(sample_record: dict[str, objec
     last = make("last", "q3", "beta.one", schema_b)
     with pytest.raises(ValueError, match="cannot build strict"):
         allocate_schema_ood_test([first, middle, last], [first], target=1)
+
+
+def _allocation_records(count: int, *, long_from: int | None = None) -> list[AcceptedRecord]:
+    records: list[AcceptedRecord] = []
+    for index in range(count):
+        long = long_from is not None and index >= long_from
+        schema = {"type": "object", "properties": {f"p{index}": {"type": "string"}}}
+        records.append(
+            AcceptedRecord(
+                source_id=str(index),
+                query=f"query {index}",
+                tools=({"name": f"api{index}.call", "parameters": schema},),
+                function_name=f"api{index}.call",
+                arguments={},
+                normalized_task=str(index),
+                candidate_prefixes=frozenset({f"api{index}"}),
+                candidate_fingerprints=frozenset({str(index)}),
+                rendered_length=1024 if long else 256,
+            )
+        )
+    return records
+
+
+def test_allocation_uses_long_records_only_for_full_endpoint() -> None:
+    short = _allocation_records(12_750)
+    long = [*short, *_allocation_records(10_000, long_from=0)]
+    # Give extension records distinct identities and group keys.
+    long = [
+        record
+        if index < len(short)
+        else AcceptedRecord(
+            source_id=f"long-{index}",
+            query=f"long query {index}",
+            tools=record.tools,
+            function_name=record.function_name,
+            arguments=record.arguments,
+            normalized_task=f"long-{index}",
+            candidate_prefixes=frozenset({f"longapi{index}"}),
+            candidate_fingerprints=frozenset({f"long-{index}"}),
+            rendered_length=1024,
+        )
+        for index, record in enumerate(long)
+    ]
+    allocation = build_nested_allocation(short, long_records=long)
+    assert {name: len(allocation[name]["train"]) for name in ("smoke", "day1", "core", "full")} == {
+        "smoke": 128,
+        "day1": 2000,
+        "core": 10000,
+        "full": 20000,
+    }
+    core_ids = {item.source_id for item in allocation["core"]["train"]}
+    full_ids = {item.source_id for item in allocation["full"]["train"]}
+    assert core_ids <= full_ids
+    assert all(item.rendered_length <= 512 for item in allocation["core"]["train"])
+    assert any(item.rendered_length > 512 for item in allocation["full"]["train"])
+    ood_prefixes = set().union(
+        *(item.candidate_prefixes for item in allocation["schema_ood"]["test"])
+    )
+    selected = [item for name in ("core", "full") for item in allocation[name]["train"]]
+    assert not any(item.candidate_prefixes & ood_prefixes for item in selected)
+    repeat = build_nested_allocation(short, long_records=long)
+    assert [item.source_id for item in allocation["full"]["train"]] == [
+        item.source_id for item in repeat["full"]["train"]
+    ]
+
+
+def test_allocation_failure_reports_token_tier_counts() -> None:
+    with pytest.raises(ValueError, match=r"eligible_512=100, eligible_2048=100"):
+        build_nested_allocation(_allocation_records(100))
+
+
+def test_short_allocation_does_not_require_full_extension() -> None:
+    short = _allocation_records(12_750)
+    allocation = build_nested_allocation(short, require_full=False)
+    assert {name: len(allocation[name]["train"]) for name in ("smoke", "day1", "core")} == {
+        "smoke": 128,
+        "day1": 2000,
+        "core": 10000,
+    }
+    assert len(allocation["schema_ood"]["test"]) == 1000
+    assert len(allocation["nested_10k"]["train"]) == 10000
+    assert "full" not in allocation
+    with pytest.raises(ValueError, match=r"2048-token full train extension.*eligible_512=12750"):
+        build_nested_allocation(short)
+
+
+def test_dataset_manifest_v2_is_sanitized_and_content_addressed() -> None:
+    records = _allocation_records(2)
+    manifest = dataset_manifest_v2(
+        version="fixture",
+        allocation={"train": records},
+        eligibility_counts={"eligible_512": 2, "eligible_2048": 2},
+        source_descriptors=[{"dataset": "fixture", "revision": "abc", "kind": "test"}],
+        prompt_contract_version=1,
+    )
+    validate_dataset_manifest_v2(manifest)
+    assert (manifest["filter_version"], manifest["split_version"]) == (2, 2)
+    assert (DATA_FILTER_VERSION, SPLIT_VERSION) == (2, 2)
+    assert "query" not in str(manifest)
+    manifest["split_locks"]["train"]["count"] = 3
+    with pytest.raises(ValueError, match="content hash"):
+        validate_dataset_manifest_v2(manifest)
