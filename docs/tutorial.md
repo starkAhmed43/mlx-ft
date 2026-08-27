@@ -17,16 +17,17 @@ normalization, rendering, parser, metric, masking, configuration, and
 arithmetic examples without downloading, training, executing tools, or
 initializing W&B.
 
-Current study runs use immutable nested training pools (1k, 5k, 10k, and
-20k), shared locked validation/test sets, and a strict schema-OOD test outside
-the full training and validation API/schema components. Use
-`ftlab data audit --version smoke --samples 100` to create the local ignored
-100-record inspection queue and tracked aggregate findings.
+The intended study uses immutable nested training pools (1k, 5k, 10k, and
+20k), shared locked IID validation/test sets, and a Schema-OOD test. The
+1k/5k/10k pools use records rendered at 512 tokens or less. Only the 20k
+endpoint can add records rendered at up to 2,048 tokens. Use
+`ftlab data audit --version smoke --samples 100` only after preparing fresh
+data; it creates a local ignored inspection queue.
 
-The four legacy prompt-contract-0 runs are excluded from reports because
-training and evaluation used different prompt contracts. Current results remain preliminary until completed controlled
-runs include commit and provenance metadata. W&B private verification and
-GitHub authentication are manual external gates.
+The intentional validation study expands to 30 runs with an 8-layer,
+512-token baseline. The four legacy prompt-contract-0 runs are excluded.
+No current dataset, run, or result is evidence. W&B private verification and
+GitHub authentication remain manual external gates.
 
 ## Start with the mental model
 
@@ -76,7 +77,8 @@ Expected strict call:
 The parser checks one complete boundary, valid JSON, the tool name, an
 object-valued arguments field, and the schema. It returns a parsed call or
 a named error. Evaluation then compares the parsed call with the gold
-answer. A metric result might say task_success: 1.0 for an exact call.
+answer. A metric result can report task_success: 1.0 without exact_match: 1.0
+when valid optional arguments differ.
 Neither the parser nor this lab contacts a weather service.
 
 ~~~mermaid
@@ -179,16 +181,18 @@ ftlab.metrics.Evaluation reports these fields:
 - json_validity: fraction with valid JSON after the tool boundary is parsed.
 - schema_validity: fraction whose parsed arguments pass the tool schema. A
   schema failure can still be JSON-valid and can still name the supplied tool.
-- argument_key_f1: F1 for predicted versus gold argument leaf paths.
-- argument_value_f1: F1 for matching values at shared leaf paths.
+- argument_key_f1: micro-F1 over predicted versus gold argument leaf paths.
+- argument_value_f1: micro-F1 over matching values at shared leaf paths.
 - exact_match: fraction with the exact tool and recursively exact arguments.
-- task_success: version 1’s task result; it equals exact tool-and-argument matching.
-- parser_errors: counts by strict parser error category.
+- task_success: correct tool, schema-valid arguments, and every required gold
+  argument correct. Optional arguments and exact-object equality are separate.
+- parser_errors: parser diagnostics such as incomplete boundaries or invalid JSON.
+- task_error_categories: task failures such as wrong tool, missing argument,
+  extra argument, wrong type, or wrong enum/value.
 
 Parser failures have zero validity and correctness for that record. Key and
-value F1 use nested leaf paths such as location.city and location.country, not only
-top-level keys. The implementation calculates each example’s F1 first, then
-averages those scores. Strings are trimmed and normalized to Unicode NFC.
+value F1 aggregate nested leaf paths such as location.city and location.country
+across the evaluated records. Strings are trimmed and normalized to Unicode NFC.
 Integers and floats can match by numeric value only when the schema says
 number; booleans never match numbers. Exact matching still checks the
 complete argument structure.
@@ -210,38 +214,15 @@ The strict parser rejects:
 Schema-invalid arguments are reported separately after valid JSON and tool
 parsing. They do not erase the JSON or tool validity measurements.
 
-## Data scope and frozen smoke counts
+## Data scope
 
 The pinned source is Salesforce/xlam-function-calling-60k at revision
-26d14ebfe18b1f7b524bd39b404b50af5dc97866. The frozen smoke preparation
-produced this exact source-to-accepted flow:
-
-| Stage | Count |
-| --- | ---: |
-| Source | 60,000 |
-| Accepted | 21,718 |
-| Rejected | 38,282 |
-
-| Rejection category | Count |
-| --- | ---: |
-| Exactly one answer | 29,059 |
-| Rendered length | 2,295 |
-| Bare list | 2,644 |
-| Union | 1,145 |
-| Tuple | 1,069 |
-| Callable | 510 |
-| Dict without properties | 397 |
-| Candidate names not unique | 260 |
-| Set | 213 |
-| Duplicate gold conflict | 121 |
-| Gold schema failure | 550 |
-| Unsupported native schema keyword | 19 |
-
-This table is strict scope filtering, not a claim that all source records
-are bad. A record is rejected when it has inconsistent or ambiguous source
-data, an unsupported schema shape, or does not fit the rendered prompt limit
-of 512 tokens. All unsupported cases remain rejected. Duplicate groups keep
-conflicting gold answers out of a split.
+26d14ebfe18b1f7b524bd39b404b50af5dc97866. No prepared dataset is included.
+Normalization rejects inconsistent or ambiguous source data and unsupported
+schema shapes. It records rendered length independently of normalization.
+Small pools require a 512-token limit; only the final 20k endpoint may use the
+2,048-token tier. Duplicate groups and conflicting gold answers stay out of
+locked splits.
 
 ## Setup
 

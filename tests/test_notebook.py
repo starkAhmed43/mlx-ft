@@ -65,24 +65,8 @@ def test_tutorial_preserves_pinned_pipeline_facts() -> None:
         "26d14ebfe18b1f7b524bd39b404b50af5dc97866",
     ):
         assert revision in tutorial
-    assert "| Source | 60,000 |" in tutorial
-    assert "| Accepted | 21,718 |" in tutorial
-    assert "| Rejected | 38,282 |" in tutorial
-    for category, count in {
-        "Exactly one answer": 29059,
-        "Rendered length": 2295,
-        "Bare list": 2644,
-        "Union": 1145,
-        "Tuple": 1069,
-        "Callable": 510,
-        "Dict without properties": 397,
-        "Candidate names not unique": 260,
-        "Set": 213,
-        "Duplicate gold conflict": 121,
-        "Gold schema failure": 550,
-        "Unsupported native schema keyword": 19,
-    }.items():
-        assert f"| {category} | {count:,} |" in tutorial
+    assert "No prepared dataset is included." in tutorial
+    assert "only the final 20k endpoint" in tutorial
 
     assert "starkahmed43/mlx-ft" in tutorial
     assert re.search(r"accepts the\s+supplied entity and project", tutorial)
@@ -204,10 +188,10 @@ def test_notebook_safe_cells_compile_and_execute_sequentially() -> None:
         "tool_accuracy": 0.75,
         "json_validity": 0.75,
         "schema_validity": 0.75,
-        "argument_key_f1": 2 / 3,
-        "argument_value_f1": 5 / 12,
+        "argument_key_f1": 10 / 13,
+        "argument_value_f1": 6 / 13,
         "exact_match": 0.25,
-        "task_success": 0.25,
+        "task_success": 0.5,
     }.items():
         assert math.isclose(getattr(evaluation, attribute), expected)
     assert evaluation.parser_errors == {"thinking_block": 1}

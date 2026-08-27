@@ -1,7 +1,7 @@
 # mlx-ft
 
-`mlx-ft` is a small, learning-focused lab for function-calling fine-tuning on Apple Silicon.
-The first milestone validates the full Qwen3 0.6B 4-bit pipeline. It does not claim a quality gain.
+`mlx-ft` is a learning-focused lab for function-calling fine-tuning on Apple Silicon.
+It contains the study implementation, not completed study results.
 
 Use the dedicated Conda environment from `environment.yml`, then run the locked sync:
 
@@ -44,14 +44,22 @@ Reproduce the corrected smoke workflow with:
 scripts/reproduce-smoke.sh
 ```
 
-The best-run wrapper refuses to run until a selected completed controlled
-artifact and resolved configuration are supplied:
+The study uses an intentional 30-run, 8-layer, 512-token baseline matrix.
+Small datasets use records rendered at 512 tokens or less. Only the 20k
+training endpoint can add records rendered at up to 2,048 tokens.
+
+Official final test evaluation is locked and test-once. Exact reruns are
+allowed, but the system labels them as replicas. BFCL validates the selected
+validation winner; it never selects or tunes a winner.
+
+The final reproduction wrapper requires a committed selection lock:
 
 ```sh
-scripts/reproduce-best.sh --run runs/SELECTED_RUN --config configs/experiments/selected.yaml
+scripts/reproduce-best.sh --candidate RUN_ID
 ```
 
-Reports are preliminary until final controlled runs have commit and provenance
-metadata. The four legacy prompt-contract-0 runs are excluded from reports.
-No W&B or GitHub upload occurs by default. Private-project and repository-auth
-checks remain manual external gates.
+Tracked evidence is limited to sanitized dataset descriptors, selection locks,
+and final tables, figures, and findings. Raw records, models, adapters,
+predictions, and run directories remain local and ignored. The four legacy
+prompt-contract-0 runs are excluded. No result, prepared dataset, or quality
+gain is claimed here.
