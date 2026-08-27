@@ -14,6 +14,216 @@ from ftlab.data import AcceptedRecord, normalize_record
 from ftlab.rendering import render_json_call
 
 
+def test_final_evaluate_orchestrates_all_locked_regimes(tmp_path, monkeypatch) -> None:
+    candidate = "winner"
+    source = tmp_path / "runs" / candidate
+    (source / "adapter").mkdir(parents=True)
+    (source / "adapter" / "adapters.safetensors").write_bytes(b"adapter")
+    (source / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_version": 2,
+                "controlled": True,
+                "status": "completed",
+                "selection": {"recipe": {}, "resolved_fingerprint": ""},
+                "config": {"model": "m", "model_revision": "r"},
+                "hashes": {"model": "h", "adapter": ""},
+            }
+        )
+    )
+    for dataset in ("core", "schema_ood"):
+        path = tmp_path / "data" / dataset
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text("{}")
+    (tmp_path / "data" / "bfcl.manifest.json").write_text(
+        json.dumps({"records_file": "bfcl.records.jsonl"})
+    )
+    (tmp_path / "data" / "bfcl.records.jsonl").write_text("{}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "load_final_lock",
+        lambda _: {
+            "content_sha256": "lock",
+            "candidates": [candidate],
+            "candidate_recipes": {candidate: {}},
+        },
+    )
+    calls = []
+
+    def fake_run(contract, request):
+        calls.append(request["mode"])
+        if request["mode"] == "evaluate":
+            contract.path("predictions.jsonl").write_text("{}\n")
+            contract.path("evaluation.json").write_text("{}")
+        else:
+            contract.path("predictions.jsonl").write_text("{}\n")
+        from ftlab.runner import RunnerResult
+
+        return RunnerResult(0, None, "completed", {}, None, 0)
+
+    monkeypatch.setattr(cli_module, "run_isolated", fake_run)
+    monkeypatch.setattr(cli_module, "evaluate_bfcl", lambda *args, **kwargs: [])
+    monkeypatch.setattr(cli_module, "_validate_final_source", lambda *args: None)
+    result = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", candidate])
+    assert result.exit_code == 0, result.output
+    assert calls == ["evaluate", "evaluate", "bfcl"]
+    receipt = next((tmp_path / "reports" / "final-evaluations").glob("*.json"))
+    assert json.loads(receipt.read_text())["status"] == "completed"
+    duplicate = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", candidate])
+    assert duplicate.exit_code == 1
+    replica = CliRunner().invoke(
+        app, ["study", "final-evaluate", "--candidate", candidate, "--replica"]
+    )
+    assert replica.exit_code == 0, replica.output
+    replica_receipt = next(
+        path for path in (tmp_path / "reports" / "final-evaluations").glob("*.replica-*.json")
+    )
+    assert json.loads(replica_receipt.read_text())["official_result"] == receipt.name
+    assert json.loads(replica_receipt.read_text())["official_result_sha256"]
+
+
+def test_final_evaluate_failure_writes_failed_receipt(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "load_final_lock",
+        lambda _: {
+            "content_sha256": "lock",
+            "candidates": ["winner"],
+            "candidate_recipes": {"winner": {}},
+        },
+    )
+    (tmp_path / "runs" / "winner" / "adapter").mkdir(parents=True)
+    (tmp_path / "runs" / "winner" / "adapter" / "adapters.safetensors").write_bytes(b"adapter")
+    (tmp_path / "runs" / "winner" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_version": 2,
+                "controlled": True,
+                "status": "completed",
+                "selection": {"recipe": {}, "resolved_fingerprint": ""},
+                "config": {"model": "m", "model_revision": "r"},
+                "hashes": {},
+            }
+        )
+    )
+    (tmp_path / "data" / "core").mkdir(parents=True)
+    (tmp_path / "data" / "core" / "manifest.json").write_text("{}")
+    from ftlab.runner import RunnerResult
+
+    monkeypatch.setattr(
+        cli_module, "run_isolated", lambda *args: RunnerResult(1, None, "failed", None, "boom", 0)
+    )
+    monkeypatch.setattr(cli_module, "_validate_final_source", lambda *args: None)
+    result = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", "winner"])
+    assert result.exit_code == 1
+    receipt = next((tmp_path / "reports" / "final-evaluations").glob("*.json"))
+    assert json.loads(receipt.read_text())["status"] == "failed"
+
+
+def test_failed_official_final_attempt_retries_with_new_run_ids(tmp_path, monkeypatch) -> None:
+    candidate = "winner"
+    source = tmp_path / "runs" / candidate
+    (source / "adapter").mkdir(parents=True)
+    (source / "adapter" / "adapters.safetensors").write_bytes(b"adapter")
+    (source / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_version": 2,
+                "controlled": True,
+                "status": "completed",
+                "selection": {"recipe": {}, "resolved_fingerprint": ""},
+                "config": {"model": "m", "model_revision": "r"},
+                "hashes": {"model": "h", "adapter": ""},
+            }
+        )
+    )
+    for dataset in ("core", "schema_ood"):
+        path = tmp_path / "data" / dataset
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text("{}")
+    (tmp_path / "data" / "bfcl.manifest.json").write_text(
+        json.dumps({"records_file": "bfcl.records.jsonl"})
+    )
+    (tmp_path / "data" / "bfcl.records.jsonl").write_text("{}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "load_final_lock",
+        lambda _: {
+            "content_sha256": "lock",
+            "candidates": [candidate],
+            "candidate_recipes": {candidate: {}},
+        },
+    )
+    monkeypatch.setattr(cli_module, "_validate_final_source", lambda *args: None)
+    monkeypatch.setattr(cli_module, "evaluate_bfcl", lambda *args, **kwargs: [])
+    calls = 0
+
+    def fake_run(contract, request):
+        nonlocal calls
+        calls += 1
+        from ftlab.runner import RunnerResult
+
+        if calls == 1:
+            return RunnerResult(1, None, "failed", None, "first failure", 0)
+        if request["mode"] == "evaluate":
+            contract.path("predictions.jsonl").write_text("{}\n")
+            contract.path("evaluation.json").write_text("{}")
+        else:
+            contract.path("predictions.jsonl").write_text("{}\n")
+        return RunnerResult(0, None, "completed", {}, None, 0)
+
+    monkeypatch.setattr(cli_module, "run_isolated", fake_run)
+    first = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", candidate])
+    assert first.exit_code == 1
+    failed_run = next((tmp_path / "runs").glob("final-*-iid_test"))
+    assert (failed_run / "manifest.json").is_file()
+    second = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", candidate])
+    assert second.exit_code == 0, second.output
+    assert list((tmp_path / "runs").glob("final-*-iid_test-attempt-1"))
+
+
+def test_final_evaluate_rejects_source_that_drifted_from_lock(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    candidate = "winner"
+    (tmp_path / "runs" / candidate / "adapter").mkdir(parents=True)
+    (tmp_path / "runs" / candidate / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_version": 2,
+                "controlled": True,
+                "status": "completed",
+                "selection": {"recipe": {"context": 512}, "resolved_fingerprint": "actual"},
+                "hashes": {"model": "model"},
+                "git": {"commit": "actual"},
+                "config": {"model": "m", "model_revision": "r"},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_final_lock",
+        lambda _: {
+            "content_sha256": "lock",
+            "candidates": [candidate],
+            "candidate_recipes": {
+                candidate: {
+                    "recipe": {"context": 2048},
+                    "resolved_fingerprint": "actual",
+                    "hashes": {"model": "model"},
+                    "git_commit": "actual",
+                }
+            },
+        },
+    )
+    result = CliRunner().invoke(app, ["study", "final-evaluate", "--candidate", candidate])
+    assert result.exit_code == 1
+    receipt = next((tmp_path / "reports" / "final-evaluations").glob("*.json"))
+    assert json.loads(receipt.read_text())["status"] == "failed"
+
+
 def test_cli_exposes_report_build() -> None:
     result = CliRunner().invoke(app, ["report", "--help"])
     assert result.exit_code == 0
@@ -167,6 +377,41 @@ def test_fixture_prepare_validate_and_tamper(tmp_path, monkeypatch) -> None:
     tampered = CliRunner().invoke(app, ["data", "validate", "--version", "smoke"])
     assert tampered.exit_code == 1
     assert "processed hash" in tampered.stderr
+
+
+def test_small_versions_do_not_require_the_20k_extension(tmp_path, monkeypatch) -> None:
+    """The shared short pool can support core without supporting full."""
+    records = [
+        {
+            "id": f"fixture-{index}",
+            "query": f"Question {index}",
+            "tools": [
+                {
+                    "name": f"api{index}.echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {f"field_{index}": {"type": "string"}},
+                    },
+                }
+            ],
+            "answers": [{"name": f"api{index}.echo", "arguments": {}}],
+        }
+        for index in range(12_750)
+    ]
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(records), encoding="utf-8")
+    shutil.copy(Path(__file__).parents[1] / "uv.lock", tmp_path / "uv.lock")
+    monkeypatch.chdir(tmp_path)
+    for version in ("smoke", "day1", "core"):
+        result = CliRunner().invoke(
+            app, ["data", "prepare", "--version", version, "--source", str(source)]
+        )
+        assert result.exit_code == 0, result.output
+    full = CliRunner().invoke(
+        app, ["data", "prepare", "--version", "full", "--source", str(source)]
+    )
+    assert full.exit_code == 1
+    assert "2048-token full train extension" in full.stderr
 
 
 def test_robustness_fixture_predictions_are_uncontrolled(tmp_path, monkeypatch) -> None:

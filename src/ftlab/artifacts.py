@@ -9,7 +9,7 @@ import os
 import platform
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,18 +19,15 @@ import yaml
 
 from .config import PROMPT_CONTRACT_VERSION
 
-ARTIFACT_VERSION = 1
-REQUIRED_ARTIFACTS = (
-    "resolved_config.yaml",
-    "manifest.json",
-    "adapter",
-    "train.log",
-    "training_metrics.jsonl",
-    "system_metrics.csv",
-    "predictions.jsonl",
-    "evaluation.json",
-    "status.json",
-)
+ARTIFACT_VERSION = 2
+COMMON_ARTIFACTS = ("resolved_config.yaml", "manifest.json", "status.json")
+COMPLETED_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "training": ("adapter", "train.log", "training_metrics.jsonl", "system_metrics.csv"),
+    "evaluation": ("predictions.jsonl", "evaluation.json", "system_metrics.csv"),
+    "benchmark": ("system_metrics.csv",),
+    "robustness": ("predictions.jsonl", "evaluation.json", "system_metrics.csv"),
+    "bfcl": ("predictions.jsonl", "evaluation.json", "system_metrics.csv"),
+}
 
 
 def _sha256(value: bytes) -> str:
@@ -107,6 +104,11 @@ def _sanitize_value(value: Any, root: Path) -> Any:
     if isinstance(value, str):
         return _sanitize_string(value, root)
     return value
+
+
+def sanitize_persisted_value(value: Any, root: str | Path) -> Any:
+    """Remove private values before writing metadata to a run artifact."""
+    return _sanitize_value(value, Path(root).resolve())
 
 
 def _sanitize_string(value: str, root: Path) -> str:
@@ -216,12 +218,11 @@ def create_run_contract(
     run_dir = base / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     safe_config = _sanitize_value(config, base)
+    # Training backends receive this output directory. Its emptiness is only
+    # acceptable while the run is still started.
     (run_dir / "adapter").mkdir()
-    for name in REQUIRED_ARTIFACTS:
-        path = run_dir / name
-        if name == "adapter":
-            continue
-        path.touch()
+    # Do not create empty output placeholders. A completed run must prove that
+    # each artifact was actually produced.
     (run_dir / "status.json").write_text(json.dumps({"status": "started"}) + "\n")
     now = datetime.now(UTC).isoformat()
     hashes = {
@@ -238,6 +239,7 @@ def create_run_contract(
         "kind": kind,
         "run_id": run_id,
         "command": _sanitize_value(command or ["ftlab"], base),
+        "worker_command": None,
         "started_at": now,
         "finished_at": None,
         "git": _git_identity(base),
@@ -256,6 +258,7 @@ def create_run_contract(
             "target_tokens": None,
         },
         "bytes": {"adapter": None, "checkpoint": None},
+        "requirements": {"tokenizer_hash": False, "checkpoint_bytes": False},
         "controlled": False,
         "comparable_rendering": False,
         "status": "started",
@@ -263,7 +266,7 @@ def create_run_contract(
         "config": safe_config,
     }
     if manifest:
-        payload["manifest"] = manifest
+        payload["manifest"] = _sanitize_value(manifest, base)
     _write_json(run_dir / "manifest.json", payload)
     (run_dir / "resolved_config.yaml").write_text(yaml.safe_dump(safe_config, sort_keys=True))
     return RunContract(base, run_dir, kind, payload)
@@ -299,6 +302,8 @@ def update_manifest(run: RunContract, **updates: Any) -> dict[str, Any]:
             payload.setdefault("hashes", {}).update(value)
         elif key == "counts" and isinstance(value, dict):
             payload.setdefault("counts", {}).update(value)
+        elif key in {"bytes", "requirements"} and isinstance(value, dict):
+            payload.setdefault(key, {}).update(value)
         else:
             payload[key] = value
     _write_json(run.path("manifest.json"), payload)
@@ -319,19 +324,50 @@ def write_status(run: RunContract, status: str, **extra: Any) -> None:
 
 def append_training_metric(run: RunContract, value: dict[str, Any]) -> None:
     with run.path("training_metrics.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, sort_keys=True, allow_nan=False) + "\n")
+        handle.write(
+            json.dumps(_sanitize_value(value, run.root), sort_keys=True, allow_nan=False) + "\n"
+        )
 
 
 def append_system_metric(run: RunContract, value: dict[str, Any]) -> None:
+    value = _sanitize_value(value, run.root)
     path = run.path("system_metrics.csv")
     fields = list(value)
-    exists = path.stat().st_size > 0
+    exists = path.exists() and path.stat().st_size > 0
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if not exists:
             writer.writeheader()
         writer.writerow(value)
         handle.flush()
+
+
+def summarize_system_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return before, peak, and after values for runtime resource samples."""
+    fields = (
+        "rss_gib",
+        "mlx_allocator_active_bytes",
+        "mlx_allocator_peak_bytes",
+        "swap_used_gib",
+    )
+    summary: dict[str, Any] = {"samples": len(samples)}
+    for field in fields:
+        values = [
+            float(sample[field]) for sample in samples if isinstance(sample.get(field), int | float)
+        ]
+        if values:
+            summary[field] = {"before": values[0], "peak": max(values), "after": values[-1]}
+    pressures = [
+        str(sample["pressure_state"]) for sample in samples if sample.get("pressure_state")
+    ]
+    if pressures:
+        order = {"unknown": 0, "normal": 1, "warning": 2, "critical": 3}
+        summary["pressure_state"] = {
+            "before": pressures[0],
+            "peak": max(pressures, key=lambda item: order.get(item, 0)),
+            "after": pressures[-1],
+        }
+    return summary
 
 
 def validate_run_artifacts(
@@ -341,7 +377,7 @@ def validate_run_artifacts(
 ) -> list[str]:
     """Return missing artifacts, with type-specific completion requirements."""
     path = Path(run_dir)
-    missing = [name for name in REQUIRED_ARTIFACTS if not (path / name).exists()]
+    missing = [name for name in COMMON_ARTIFACTS if not (path / name).exists()]
     status_path = path / "status.json"
     if status_path.exists():
         try:
@@ -349,22 +385,28 @@ def validate_run_artifacts(
         except json.JSONDecodeError:
             status = None
         if status == "completed":
-            required = ["manifest.json", "status.json"]
-            if kind == "training":
-                required += ["adapter", "training_metrics.jsonl"]
-            elif kind in {"evaluation", "robustness", "bfcl"}:
-                required += ["predictions.jsonl", "evaluation.json"]
+            required = [*COMMON_ARTIFACTS, *COMPLETED_ARTIFACTS[kind]]
             missing.extend(
                 name
                 for name in required
                 if not (path / name).exists()
                 or (path / name).is_file()
                 and (path / name).stat().st_size == 0
+                or (path / name).is_dir()
+                and not any((path / name).iterdir())
             )
-            if (
-                kind == "training"
-                and (path / "adapter").exists()
-                and not any((path / "adapter").iterdir())
-            ):
-                missing.append("adapter")
+            manifest_path = path / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except OSError, json.JSONDecodeError:
+                manifest = {}
+            requirements = manifest.get("requirements", {}) if isinstance(manifest, dict) else {}
+            hashes = manifest.get("hashes", {}) if isinstance(manifest, dict) else {}
+            sizes = manifest.get("bytes", {}) if isinstance(manifest, dict) else {}
+            if isinstance(requirements, Mapping) and requirements.get("tokenizer_hash"):
+                if not isinstance(hashes, Mapping) or not hashes.get("tokenizer"):
+                    missing.append("manifest.hashes.tokenizer")
+            if isinstance(requirements, Mapping) and requirements.get("checkpoint_bytes"):
+                if not isinstance(sizes, Mapping) or not isinstance(sizes.get("checkpoint"), int):
+                    missing.append("manifest.bytes.checkpoint")
     return sorted(set(missing))

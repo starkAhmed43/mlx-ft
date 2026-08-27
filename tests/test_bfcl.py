@@ -78,6 +78,9 @@ def test_bfcl_worker_handles_nested_shape_and_preserves_id(tmp_path, monkeypatch
         def encode(self, value, **kwargs):
             return list(range(len(value)))
 
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"]
+
     monkeypatch.setattr(
         "ftlab.worker.load_model",
         lambda *args, **kwargs: (object(), Tokenizer()),
@@ -97,7 +100,7 @@ def test_bfcl_worker_handles_nested_shape_and_preserves_id(tmp_path, monkeypatch
         }
     )
     assert result["count"] == 1
-    assert json.loads(predictions.read_text()) ["id"] == "official-1"
+    assert json.loads(predictions.read_text())["id"] == "official-1"
 
 
 def test_bfcl_selection_is_deterministic() -> None:
@@ -182,8 +185,14 @@ def test_bfcl_evaluate_stages_jsonl_rows_and_commands(tmp_path, monkeypatch) -> 
         return __import__("subprocess").CompletedProcess(command, 0, "ok", "")
 
     monkeypatch.setattr("ftlab.bfcl.subprocess.run", fake_run)
+    monkeypatch.setattr("ftlab.bfcl.bfcl_preflight", lambda: {"bfcl_version": "2026.3.23"})
+    monkeypatch.setattr(
+        "ftlab.study.load_final_lock",
+        lambda root: {"candidates": ["fixture"], "content_sha256": "fixture"},
+    )
     evaluate_bfcl(run, project_root=tmp_path)
-    staged = tmp_path / "result" / "mlx_ftlab" / "BFCL_v3_simple_python_result.json"
+    staged = tmp_path / "result" / "mlx_ftlab" / "BFCL_v4_simple_python_result.json"
     lines = staged.read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0]) == {"id": "s-1", "result": "one"}
     assert all("--result-dir" in command for command in calls)
+    assert all(command[:4] == ["conda", "run", "-n", "mlx-ft-bfcl"] for command in calls)

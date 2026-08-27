@@ -86,8 +86,8 @@ def expand_matrix_values(config: SweepConfig | str | Path) -> list[dict[str, Any
     return [run.values for run in expand_matrix(config)]
 
 
-def selection_key(result: dict[str, Any]) -> tuple[float, float, float, float, float]:
-    """Rank quality first, then schema validity, memory, and learning rate."""
+def selection_key(result: dict[str, Any]) -> tuple[float, float, float, float, float, str]:
+    """Rank validation runs with the locked study tie-break order."""
     measured = result.get("selection")
     if isinstance(measured, dict):
         result = {**result, **measured}
@@ -96,7 +96,13 @@ def selection_key(result: dict[str, Any]) -> tuple[float, float, float, float, f
         float(result.get("argument_value_f1", 0.0)),
         float(result.get("schema_validity", 0.0)),
         -float(result.get("rss_gib", result.get("peak_rss_gib", float("inf")))),
-        -float(result.get("learning_rate", float("inf"))),
+        float(
+            result.get(
+                "generation_throughput_tokens_per_second",
+                result.get("throughput_tokens_per_second", 0.0),
+            )
+        ),
+        str(result.get("fingerprint", result.get("run_id", ""))),
     )
 
 
@@ -108,6 +114,23 @@ def select_best(results: list[dict[str, Any]]) -> dict[str, Any] | None:
         and isinstance(item.get("selection", item), dict)
     ]
     return max(complete, key=selection_key) if complete else None
+
+
+def select_learning_rates_by_precision(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Select one completed learning-rate pilot for each precision."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        selection = row.get("selection", row)
+        if not isinstance(selection, dict) or selection.get("study_role") != "lr_pilot":
+            continue
+        precision = str(selection.get("precision", ""))
+        if precision:
+            grouped.setdefault(precision, []).append(row)
+    return {
+        precision: selected
+        for precision, rows in grouped.items()
+        if (selected := select_best(rows))
+    }
 
 
 def run_sweep(

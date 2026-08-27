@@ -39,7 +39,7 @@ def system_metrics() -> dict[str, float | str]:
         # Sandboxed CI can deny swap counters. Keep the row usable.
         swap = type("Swap", (), {"used": 0, "percent": 0.0})()
     free = shutil.disk_usage(Path.cwd()).free / (1024**3)
-    return {
+    result: dict[str, float | str] = {
         "memory_available_gib": memory.available / (1024**3),
         "memory_used_percent": float(memory.percent),
         "cpu_percent": float(psutil.cpu_percent(interval=None)),
@@ -48,6 +48,28 @@ def system_metrics() -> dict[str, float | str]:
         "disk_free_gib": free,
         "pressure_state": pressure_state(),
     }
+    result.update(allocator_metrics())
+    return result
+
+
+def allocator_metrics() -> dict[str, float]:
+    """Read MLX allocator counters when MLX is available in this process."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return {}
+    result: dict[str, float] = {}
+    for key, name in (
+        ("mlx_allocator_active_bytes", "get_active_memory"),
+        ("mlx_allocator_peak_bytes", "get_peak_memory"),
+    ):
+        getter = getattr(mx, name, None)
+        if callable(getter):
+            try:
+                result[key] = float(getter())
+            except TypeError, ValueError:
+                pass
+    return result
 
 
 def pressure_state() -> str:

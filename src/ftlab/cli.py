@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import platform
 from datetime import UTC, datetime
@@ -13,28 +14,33 @@ from typing import Any, cast
 import typer
 
 from .artifacts import (
+    append_system_metric,
     append_training_metric,
     controlled_run_eligible,
     create_run_contract,
     update_manifest,
+    validate_run_artifacts,
     write_status,
 )
-from .bfcl import evaluate_bfcl, export_bfcl_responses, prepare_bfcl
+from .bfcl import bfcl_preflight, evaluate_bfcl, export_bfcl_responses, prepare_bfcl
 from .config import MODEL_ID, get_model_spec, load_config
 from .data import (
+    DATA_FILTER_VERSION,
+    SPLIT_VERSION,
     AcceptedRecord,
-    allocate_schema_ood_test,
     audit_queue,
     audit_records,
     build_full_allocation,
     build_nested_allocation,
     context_eligible_records,
+    dataset_manifest_v2,
     duplicate_groups,
     load_xlam,
     normalize_records,
     source_flow,
     stratified_split_records,
     stratify_records,
+    validate_dataset_manifest_v2,
 )
 from .environment import validate_conda_environment
 from .hashing import sha256_file, sha256_records
@@ -51,7 +57,16 @@ from .storage import (
     system_metrics,
     write_json,
 )
-from .sweep import SweepConfig, SweepRun, expand_matrix, load_sweep, run_sweep, select_best
+from .study import create_final_lock, load_final_lock
+from .sweep import (
+    SweepConfig,
+    SweepRun,
+    expand_matrix,
+    load_sweep,
+    run_sweep,
+    select_best,
+    select_learning_rates_by_precision,
+)
 from .tracking import finish_tracking, init_tracking, sanitized_row, validate_metric_allowlist
 
 app = typer.Typer(
@@ -63,12 +78,14 @@ report_app = typer.Typer(help="Build local reports.")
 robustness_app = typer.Typer(help="Prepare and score call/no-call robustness fixtures.")
 benchmark_app = typer.Typer(help="Run bounded benchmark safety probes.")
 bfcl_app = typer.Typer(help="Use the optional pinned BFCL benchmark adapter.")
+study_app = typer.Typer(help="Lock and reproduce the final test-once study stage.")
 app.add_typer(data_app, name="data")
 app.add_typer(storage_app, name="storage")
 app.add_typer(report_app, name="report")
 app.add_typer(robustness_app, name="robustness")
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(bfcl_app, name="bfcl")
+app.add_typer(study_app, name="study")
 
 
 def _root() -> Path:
@@ -209,13 +226,11 @@ def data_prepare(
             )
             accepted, rejected = normalize_records(
                 records,
-                max_seq_length=None if max_seq_length > 512 else max_seq_length,
+                max_seq_length=None,
                 length_fn=lambda item: len(render_record(item, tokenizer).full_tokens),
             )
         else:
-            accepted, rejected = normalize_records(
-                records, max_seq_length=None if max_seq_length > 512 else max_seq_length
-            )
+            accepted, rejected = normalize_records(records, max_seq_length=None)
         context_base: dict[str, Any] | None = None
         if max_seq_length > 512:
             can_build_full = version in {
@@ -226,7 +241,9 @@ def data_prepare(
             if can_build_full:
                 core_path = _root() / "data" / "core" / "manifest.json"
                 if not core_path.exists():
-                    raise ValueError(f"2048 full eligibility requires locked core manifest: {core_path}")
+                    raise ValueError(
+                        f"2048 full eligibility requires locked core manifest: {core_path}"
+                    )
                 core_payload = json.loads(core_path.read_text(encoding="utf-8"))
                 base_validation, base_validation_rejected = normalize_records(
                     core_payload.get("splits", {}).get("validation", [])
@@ -265,52 +282,29 @@ def data_prepare(
                 eligible_train = _exclude_locked_duplicate_components(
                     eligible_all, [*base_validation, *base_test]
                 )
-                eligible_train.sort(key=lambda item: sha256_records([{"source_id": item.source_id}]))
+                eligible_train.sort(
+                    key=lambda item: sha256_records([{"source_id": item.source_id}])
+                )
                 split = {
                     "train": eligible_train,
                     "validation": base_validation,
                     "test": base_test,
                 }
                 rejected = [*rejected, *context_rejected]
-        elif version == "schema_ood":
-            full_manifest = _root() / "data" / "full" / "manifest.json"
-            if not full_manifest.exists():
-                raise ValueError(f"schema_ood requires locked full manifest: {full_manifest}")
-            full_payload = json.loads(full_manifest.read_text(encoding="utf-8"))
-            full_train, rejected_train = normalize_records(full_payload["splits"]["train"])
-            full_validation, rejected_validation = normalize_records(
-                full_payload["splits"]["validation"]
-            )
-            if rejected_train or rejected_validation:
-                raise ValueError("locked full train or validation split is invalid")
-            test = allocate_schema_ood_test(
-                accepted,
-                [*full_train, *full_validation],
-                target=1000,
-            )
-            split = {"train": [], "validation": [], "test": test}
-        elif version == "full":
-            core_manifest = _root() / "data" / "core" / "manifest.json"
-            if not core_manifest.exists():
-                raise ValueError(f"full requires locked core manifest: {core_manifest}")
-            core_payload = json.loads(core_manifest.read_text(encoding="utf-8"))
-            core_validation, rejected_validation = normalize_records(
-                core_payload["splits"]["validation"]
-            )
-            core_test, rejected_test = normalize_records(core_payload["splits"]["test"])
-            if rejected_validation or rejected_test:
-                raise ValueError("locked core validation or test split is invalid")
-            candidates = _exclude_locked_duplicate_components(
-                accepted, [*core_validation, *core_test]
-            )
-            full_train = stratified_split_records(candidates, {"train": 20000}, seed=42)["train"]
-            split = {"train": full_train, "validation": core_validation, "test": core_test}
         elif len(accepted) < 1750:
             # Tiny fixtures cannot contain the immutable 750/1000 locks. Keep
             # fixture tests useful while real pinned pools use the shared plan.
             split = stratified_split_records(accepted, sizes[version], seed=42)
         else:
-            allocation = build_nested_allocation(accepted, seed=42)
+            short_records, _ = context_eligible_records(accepted, 512)
+            long_records, _ = context_eligible_records(accepted, 2048)
+            require_full = version in {"full", "nested_20k", "nested-20k"}
+            allocation = build_nested_allocation(
+                short_records,
+                long_records=long_records,
+                require_full=require_full,
+                seed=42,
+            )
             split = allocation[version]
         root = _root()
         ensure_project_dirs(root)
@@ -320,8 +314,8 @@ def data_prepare(
         payload: dict[str, Any] = {
             "version": version,
             "seed": 42,
-            "filter_version": 1,
-            "split_version": 1,
+            "filter_version": DATA_FILTER_VERSION,
+            "split_version": SPLIT_VERSION,
             "prompt_contract_version": 1,
             "revisions": {
                 "dataset": "26d14ebfe18b1f7b524bd39b404b50af5dc97866",
@@ -419,6 +413,29 @@ def data_prepare(
         }
         write_json(output, payload)
         write_json(root / "data" / f"{version}.manifest.json", payload)
+        # Keep raw records in the ignored working manifest. The portable descriptor
+        # is safe to track and is the contract consumed by later study stages.
+        descriptor = dataset_manifest_v2(
+            version=version,
+            allocation=split,
+            eligibility_counts={
+                "eligible_512": len(context_eligible_records(accepted, 512)[0]),
+                "eligible_2048": len(context_eligible_records(accepted, 2048)[0]),
+            },
+            source_descriptors=[
+                {
+                    "dataset": "fixture" if source else "Salesforce/xlam-function-calling-60k",
+                    "revision": "fixture" if source else "26d14ebfe18b1f7b524bd39b404b50af5dc97866",
+                    "kind": "fixture" if source else "huggingface",
+                    "sha256": payload["hashes"]["input_records"],
+                }
+            ],
+            prompt_contract_version=int(payload["prompt_contract_version"]),
+        )
+        validate_dataset_manifest_v2(descriptor)
+        descriptor_dir = root / "data" / "manifests"
+        descriptor_dir.mkdir(parents=True, exist_ok=True)
+        write_json(descriptor_dir / f"{version}.json", descriptor)
         manifest_digest = sha256_file(output)
         (output_dir / "manifest.sha256").write_text(manifest_digest + "\n", encoding="utf-8")
         (root / "data" / f"{version}.manifest.sha256").write_text(
@@ -1173,7 +1190,7 @@ def sweep_command(
             return
         plan = load_sweep(config)
         pilot_results: dict[str, list[dict[str, Any]]] = {}
-        probe_results: dict[tuple[str, str], dict[str, Any]] = {}
+        probe_results: dict[str, dict[str, Any]] = {}
         completed_selections: list[dict[str, Any]] = []
         size_exposure: tuple[int, int] | None = None
         active_contract: Any = None
@@ -1196,7 +1213,25 @@ def sweep_command(
             model = str(values["model"])
             spec = get_model_spec(model)
             precision = str(values.get("precision", spec.precision))
-            probe_key = (model, precision)
+            probe_key = sha256_records(
+                [
+                    {
+                        "model": spec.model_id,
+                        "revision": spec.revision,
+                        "precision": precision,
+                        "rank": values.get("adapter_rank"),
+                        "layers": values.get("adapter_layers"),
+                        "targets": values.get("adapter_targets"),
+                        "context": values.get("context"),
+                        "microbatch": values.get("batch_size"),
+                        "accumulation": values.get("grad_accumulation_steps"),
+                        "effective_batch": values.get("effective_batch"),
+                        "dataset": values.get("dataset_version"),
+                        "dataset_size": values.get("dataset_size"),
+                        "probe_steps": 32,
+                    }
+                ]
+            )
             if probe_key not in probe_results:
                 probe_results[probe_key] = _run_sweep_probe(plan, values, root=_root(), spec=spec)
             probe = probe_results[probe_key]
@@ -1392,16 +1427,28 @@ def sweep_command(
                 ),
                 "rss_gib": measured_rss,
                 "safety_probe": probe,
-                "load_time_seconds": evaluation_worker.get("load_time_seconds"),
+                "cold_load_seconds": evaluation_worker.get(
+                    "cold_load_seconds", evaluation_worker.get("load_time_seconds")
+                ),
                 "warmup_steps_excluded": evaluation_worker.get("warmup_steps_excluded"),
                 "latency_p50": evaluation_worker.get("latency_p50"),
                 "latency_p95": evaluation_worker.get("latency_p95"),
                 "latency_p99": evaluation_worker.get("latency_p99"),
                 "prompt_tokens": evaluation_worker.get("prompt_tokens"),
                 "completion_tokens": evaluation_worker.get("completion_tokens"),
-                "throughput_tokens_per_second": evaluation_worker.get(
-                    "throughput_tokens_per_second"
+                "prompt_processing_tokens_per_second": evaluation_worker.get(
+                    "prompt_processing_tokens_per_second"
                 ),
+                "generation_throughput_tokens_per_second": evaluation_worker.get(
+                    "generation_throughput_tokens_per_second",
+                    evaluation_worker.get("throughput_tokens_per_second"),
+                ),
+                "throughput_tokens_per_second": evaluation_worker.get(
+                    "generation_throughput_tokens_per_second",
+                    evaluation_worker.get("throughput_tokens_per_second"),
+                ),
+                "allocator_memory_bytes": evaluation_worker.get("allocator_memory_bytes"),
+                "per_prediction_measurements": evaluation_worker.get("per_prediction_measurements"),
                 "throughput_quartiles": evaluation_worker.get("throughput_quartiles"),
                 "prompt_hash": prompt_hash,
                 "tokenizer_identity": evaluation_worker.get("tokenizer_identity", {}),
@@ -1422,6 +1469,10 @@ def sweep_command(
                 "rendering_hashes": rendering_hashes,
                 "throughput_tokens_per_second": evaluation_worker.get(
                     "throughput_tokens_per_second"
+                ),
+                "generation_throughput_tokens_per_second": evaluation_worker.get(
+                    "generation_throughput_tokens_per_second",
+                    evaluation_worker.get("throughput_tokens_per_second"),
                 ),
                 "validation": evaluation,
                 "rss_gib": measured_rss,
@@ -1469,8 +1520,22 @@ def sweep_command(
                     "prompt_tokens": worker.get("prompt_tokens"),
                     "target_tokens": worker.get("target_tokens"),
                 },
-                bytes={"adapter": adapter.stat().st_size},
-                hashes={"adapter": sha256_file(adapter)},
+                bytes={
+                    "adapter": worker.get("adapter_bytes", adapter.stat().st_size),
+                    "checkpoint": worker.get("checkpoint_bytes"),
+                },
+                hashes={
+                    "adapter": worker.get("adapter_hash", sha256_file(adapter)),
+                    "tokenizer": worker.get(
+                        "tokenizer_hash", evaluation_worker.get("tokenizer_hash", "")
+                    ),
+                },
+                requirements={
+                    "tokenizer_hash": bool(
+                        worker.get("tokenizer_hash") or evaluation_worker.get("tokenizer_hash")
+                    ),
+                    "checkpoint_bytes": worker.get("checkpoint_bytes") is not None,
+                },
                 selection=measured_selection,
                 study_role=values.get("study_role"),
                 axis=values.get("axis"),
@@ -1528,8 +1593,11 @@ def sweep_command(
                 if role == "lr_pilot":
                     return execute(one)
                 precision = str(one.values.get("precision", "4bit"))
-                pilot_precision = precision if pilot_results.get(precision) else "4bit"
-                selected = select_best(pilot_results.get(pilot_precision, []))
+                selected_by_precision = select_learning_rates_by_precision(
+                    [item for values in pilot_results.values() for item in values]
+                )
+                pilot_precision = precision if precision in selected_by_precision else "4bit"
+                selected = selected_by_precision.get(pilot_precision)
                 if selected is None:
                     raise RuntimeError(
                         f"no completed LR pilot is available for precision {pilot_precision}"
@@ -1549,8 +1617,7 @@ def sweep_command(
                     if not isinstance(recipe, dict):
                         raise RuntimeError("winning run has no resolved recipe")
                     seed = one.values.get("seed")
-                    resolved = {**resolved, **recipe, "seed": seed}
-                    resolved["learning_rate"] = selected["learning_rate"]
+                    resolved = {**recipe, "seed": seed, "winner_source_run": winner.get("run_id")}
                     resolved["winner_source_run"] = winner.get("run_id")
                 one = SweepRun(one.index, resolved, one.fingerprint)
                 return execute(one)
@@ -1641,11 +1708,30 @@ def _run_sweep_probe(
     train_file, valid_file = _sweep_dataset_paths(root, experiment, int(values.get("context", 512)))
     if not train_file.is_file() or not valid_file.is_file():
         raise ValueError(f"probe requires prepared dataset files for {experiment.dataset.version}")
-    run_id = f"probe-{spec.precision}-{spec.model_id.split('/')[-1]}"
     identity_hash = sha256_records([{"model": spec.model_id, "revision": spec.revision}])
     probe_fingerprint = sha256_records(
-        [{"model": spec.model_id, "revision": spec.revision, "precision": spec.precision}]
+        [
+            {
+                "model": spec.model_id,
+                "revision": spec.revision,
+                "precision": spec.precision,
+                "rank": experiment.training.lora_parameters.rank,
+                "layers": experiment.training.num_layers,
+                "targets": experiment.training.lora_parameters.keys,
+                "context": experiment.training.max_seq_length,
+                "microbatch": experiment.training.batch_size,
+                "accumulation": experiment.training.grad_accumulation_steps,
+                "effective_batch": experiment.training.batch_size
+                * experiment.training.grad_accumulation_steps,
+                "dataset": experiment.dataset.version,
+                "dataset_hash": sha256_file(
+                    root / "data" / experiment.dataset.version / "manifest.json"
+                ),
+                "probe_steps": 32,
+            }
+        ]
     )
+    run_id = f"probe-{spec.precision}-{spec.model_id.split('/')[-1]}-{probe_fingerprint[:12]}"
     existing = root / "runs" / run_id
     if existing.exists():
         existing_manifest = json.loads((existing / "manifest.json").read_text(encoding="utf-8"))
@@ -1796,6 +1882,356 @@ def bfcl_prepare_command(
 ) -> None:
     try:
         typer.echo(str(prepare_bfcl(source, output)))
+    except Exception as exc:
+        _fail(exc)
+
+
+@bfcl_app.command("preflight")
+def bfcl_preflight_command() -> None:
+    """Verify the optional BFCL evaluator in its dedicated Conda environment."""
+    try:
+        typer.echo(json.dumps(bfcl_preflight(), sort_keys=True))
+    except Exception as exc:
+        _fail(exc)
+
+
+def _sweep_selection_rows(root: Path) -> list[dict[str, Any]]:
+    path = root / "runs" / "sweep.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        selection = row.get("selection")
+        if isinstance(selection, dict):
+            run_id = row.get("run_id")
+            manifest: dict[str, Any] = {}
+            if isinstance(run_id, str):
+                try:
+                    manifest = json.loads((root / "runs" / run_id / "manifest.json").read_text())
+                except OSError, json.JSONDecodeError:
+                    pass
+            status = {}
+            if isinstance(run_id, str):
+                try:
+                    status = json.loads((root / "runs" / run_id / "status.json").read_text())
+                except OSError, json.JSONDecodeError:
+                    pass
+            run_dir = root / "runs" / str(run_id)
+            adapter = run_dir / "adapter" / "adapters.safetensors"
+            resolved = run_dir / "resolved_config.yaml"
+            immutable = (
+                {
+                    "adapter_sha256": sha256_file(adapter),
+                    "adapter_bytes": adapter.stat().st_size,
+                    "resolved_config_sha256": sha256_file(resolved),
+                    "config_sha256": (manifest.get("hashes") or {}).get("config", ""),
+                }
+                if adapter.is_file() and resolved.is_file()
+                else {}
+            )
+            rows.append(
+                {
+                    **row,
+                    "run_id": run_id,
+                    "controlled": manifest.get("controlled") is True
+                    and manifest.get("artifact_version") == 2,
+                    "validation_only": status.get("status") == "completed"
+                    and selection.get("split", "validation") == "validation",
+                    "recipe": selection.get("recipe", {}),
+                    "resolved_fingerprint": selection.get(
+                        "resolved_fingerprint", row.get("fingerprint")
+                    ),
+                    "hashes": manifest.get("hashes", {}),
+                    "git_commit": (manifest.get("git") or {}).get("commit"),
+                    "immutable": immutable,
+                }
+            )
+    return rows
+
+
+def _validate_final_source(
+    source: Path, manifest: dict[str, Any], locked_recipe: dict[str, Any]
+) -> None:
+    """Reject a source artifact that drifted after final selection was locked."""
+    if manifest.get("artifact_version") != 2 or manifest.get("controlled") is not True:
+        raise ValueError("source run is not a controlled artifact v2 run")
+    if manifest.get("status") != "completed":
+        raise ValueError("source run did not complete")
+    selection = manifest.get("selection")
+    if not isinstance(selection, dict):
+        raise ValueError("source run has no measured selection recipe")
+    if validate_run_artifacts(source, kind="training"):
+        raise ValueError("source run artifacts are incomplete")
+    adapter = source / "adapter" / "adapters.safetensors"
+    resolved = source / "resolved_config.yaml"
+    if not adapter.is_file() or not resolved.is_file():
+        raise ValueError("source run is missing immutable adapter or resolved config")
+    actual_adapter = sha256_file(adapter)
+    actual_resolved = sha256_file(resolved)
+    config_hash = hashlib.sha256(
+        json.dumps(manifest.get("config", {}), sort_keys=True).encode()
+    ).hexdigest()
+    hashes = manifest.get("hashes", {})
+    sizes = manifest.get("bytes", {})
+    if (
+        not isinstance(hashes, dict)
+        or hashes.get("adapter") != actual_adapter
+        or hashes.get("config") != config_hash
+        or not isinstance(sizes, dict)
+        or sizes.get("adapter") != adapter.stat().st_size
+    ):
+        raise ValueError("source run adapter or configuration metadata does not match its bytes")
+    immutable = locked_recipe.get("immutable", {})
+    if immutable and (
+        immutable.get("adapter_sha256") != actual_adapter
+        or immutable.get("adapter_bytes") != adapter.stat().st_size
+        or immutable.get("resolved_config_sha256") != actual_resolved
+        or immutable.get("config_sha256") != config_hash
+    ):
+        raise ValueError("source run immutable files do not match the final-selection lock")
+    expected_recipe = locked_recipe.get("recipe")
+    if expected_recipe and expected_recipe != selection.get("recipe"):
+        raise ValueError("source run recipe does not match the final-selection lock")
+    expected_fingerprint = locked_recipe.get("resolved_fingerprint")
+    if expected_fingerprint and expected_fingerprint != selection.get("resolved_fingerprint"):
+        raise ValueError("source run fingerprint does not match the final-selection lock")
+    expected_hashes = locked_recipe.get("hashes")
+    if expected_hashes and expected_hashes != manifest.get("hashes", {}):
+        raise ValueError("source run hashes do not match the final-selection lock")
+    expected_commit = locked_recipe.get("git_commit")
+    if expected_commit and expected_commit != (manifest.get("git") or {}).get("commit"):
+        raise ValueError("source run commit does not match the final-selection lock")
+
+
+@study_app.command("lock-winner")
+def study_lock_winner() -> None:
+    """Lock validation-only final candidates before any test evaluation."""
+    try:
+        lock = create_final_lock(_root(), _sweep_selection_rows(_root()))
+        typer.echo(json.dumps(lock, sort_keys=True))
+    except Exception as exc:
+        _fail(exc)
+
+
+@study_app.command("reproduce-final")
+def study_reproduce_final(candidate: str = typer.Option(..., "--candidate")) -> None:
+    """Print the exact locked test recipe without starting model work."""
+    try:
+        lock = load_final_lock(_root())
+        if candidate not in lock["candidates"]:
+            raise ValueError("candidate is not selected by final-selection lock")
+        typer.echo(
+            json.dumps(
+                {
+                    "candidate": candidate,
+                    "lock_sha256": lock["content_sha256"],
+                    "recipe": lock.get("candidate_recipes", {}).get(candidate),
+                    "datasets": ["iid_test", "schema_ood_test", "bfcl"],
+                    "selection": lock.get("selection_rule"),
+                },
+                sort_keys=True,
+            )
+        )
+    except Exception as exc:
+        _fail(exc)
+
+
+@study_app.command("final-evaluate")
+def study_final_evaluate(
+    candidate: str = typer.Option(..., "--candidate"),
+    replica: bool = typer.Option(False, "--replica", help="Label an exact rerun as a replication."),
+) -> None:
+    """Run the locked IID and Schema-OOD tests, then mark BFCL as required."""
+    try:
+        lock = load_final_lock(_root())
+        if candidate not in lock["candidates"]:
+            raise ValueError("candidate is not selected by final-selection lock")
+        if not isinstance(lock.get("candidate_recipes", {}).get(candidate), dict):
+            raise ValueError("final-selection lock has no immutable candidate recipe")
+        receipts = _root() / "reports" / "final-evaluations"
+        receipts.mkdir(parents=True, exist_ok=True)
+        token = sha256_records([{"lock": lock["content_sha256"], "candidate": candidate}])
+        official = receipts / f"{token}.json"
+        official_payload = (
+            json.loads(official.read_text(encoding="utf-8")) if official.exists() else {}
+        )
+        official_completed = official_payload.get("status") == "completed"
+        if official_completed and not replica:
+            raise RuntimeError(
+                "official final result already exists; use --replica for an exact rerun"
+            )
+        if replica and not official_completed:
+            raise RuntimeError("an exact replication requires an immutable official final result")
+        target = (
+            official
+            if not replica
+            else receipts / f"{token}.replica-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}.json"
+        )
+        if replica:
+            run_suffix = "-replica-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        elif official.exists():
+            prefix = f"final-{token[:12]}-iid_test-attempt-"
+            attempts = [
+                int(path.name.removeprefix(prefix))
+                for path in (_root() / "runs").glob(f"{prefix}*")
+                if path.name.removeprefix(prefix).isdigit()
+            ]
+            run_suffix = f"-attempt-{max(attempts, default=0) + 1}"
+        else:
+            run_suffix = ""
+        try:
+            source = _root() / "runs" / candidate
+            manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+            locked_recipe = lock["candidate_recipes"][candidate]
+            _validate_final_source(source, manifest, locked_recipe)
+            config = manifest.get("config", {})
+            model, revision = str(config.get("model", "")), str(config.get("model_revision", ""))
+            results: dict[str, str] = {}
+            for label, dataset in (("iid_test", "core"), ("schema_ood_test", "schema_ood")):
+                dataset_path = _root() / "data" / dataset / "manifest.json"
+                final_config = {
+                    **config,
+                    "workflow": "final",
+                    "regime": label,
+                    "parent_run": candidate,
+                    "dataset_version": dataset,
+                    "dataset": {"version": dataset},
+                }
+                contract = create_run_contract(
+                    _root(),
+                    f"final-{token[:12]}-{label}{run_suffix}",
+                    kind="evaluation",
+                    config=final_config,
+                    model_hash=manifest.get("hashes", {}).get("model"),
+                    tokenizer_hash=manifest.get("hashes", {}).get("tokenizer"),
+                    dataset_hash=sha256_file(dataset_path),
+                    adapter_hash=manifest.get("hashes", {}).get("adapter"),
+                    command=["ftlab", "study", "final-evaluate", "--candidate", candidate],
+                )
+                result = run_isolated(
+                    contract,
+                    {
+                        "mode": "evaluate",
+                        "model": model,
+                        "model_revision": revision,
+                        "adapter_path": str(source / "adapter"),
+                        "cache_root": str(cache_root(_root())),
+                        "manifest": str(dataset_path),
+                        "split": "test",
+                        "predictions_path": str(contract.path("predictions.jsonl")),
+                        "evaluation_path": str(contract.path("evaluation.json")),
+                    },
+                )
+                if result.status != "completed":
+                    raise RuntimeError(result.error or f"{label} evaluation failed")
+                append_system_metric(contract, system_metrics())
+                write_status(contract, "completed", result=result.result or {})
+                if validate_run_artifacts(contract.run_dir, kind="evaluation"):
+                    raise RuntimeError("final evaluation artifacts are incomplete")
+                update_manifest(
+                    contract,
+                    controlled=True,
+                    workflow="final",
+                    regime=label,
+                    bytes={"adapter": (source / "adapter" / "adapters.safetensors").stat().st_size},
+                    hashes={
+                        "adapter": sha256_file(source / "adapter" / "adapters.safetensors"),
+                        "dataset": sha256_file(dataset_path),
+                        "evaluation": sha256_file(contract.path("evaluation.json")),
+                        "predictions": sha256_file(contract.path("predictions.jsonl")),
+                    },
+                    requirements={
+                        "tokenizer_hash": bool(manifest.get("hashes", {}).get("tokenizer"))
+                    },
+                )
+                results[label] = contract.run_dir.name
+            selected_manifest = _root() / "data" / "bfcl.manifest.json"
+            selected = json.loads(selected_manifest.read_text(encoding="utf-8"))
+            records_path = selected_manifest.parent / str(selected["records_file"])
+            bfcl_id = f"{candidate}-bfcl{run_suffix}"
+            bfcl_contract = create_run_contract(
+                _root(),
+                bfcl_id,
+                kind="bfcl",
+                config={
+                    **config,
+                    "workflow": "final",
+                    "regime": "bfcl",
+                    "parent_run": candidate,
+                    "dataset_version": "bfcl",
+                    "dataset": {"version": "bfcl"},
+                },
+                model_hash=manifest.get("hashes", {}).get("model"),
+                tokenizer_hash=manifest.get("hashes", {}).get("tokenizer"),
+                dataset_hash=sha256_file(selected_manifest),
+                adapter_hash=manifest.get("hashes", {}).get("adapter"),
+                command=["ftlab", "study", "final-evaluate", "--candidate", candidate],
+            )
+            bfcl_result = run_isolated(
+                bfcl_contract,
+                {
+                    "mode": "bfcl",
+                    "model": model,
+                    "model_revision": revision,
+                    "adapter_path": str(source / "adapter"),
+                    "cache_root": str(cache_root(_root())),
+                    "records_path": str(records_path),
+                    "predictions_path": str(bfcl_contract.path("predictions.jsonl")),
+                },
+            )
+            if bfcl_result.status != "completed":
+                raise RuntimeError(bfcl_result.error or "BFCL generation failed")
+            write_json(bfcl_contract.path("evaluation.json"), bfcl_result.result or {})
+            append_system_metric(bfcl_contract, system_metrics())
+            evaluate_bfcl(bfcl_contract.run_dir, project_root=_root())
+            write_status(bfcl_contract, "completed", result=bfcl_result.result or {})
+            if validate_run_artifacts(bfcl_contract.run_dir, kind="bfcl"):
+                raise RuntimeError("final BFCL artifacts are incomplete")
+            update_manifest(
+                bfcl_contract,
+                controlled=True,
+                workflow="final",
+                regime="bfcl",
+                bytes={"adapter": (source / "adapter" / "adapters.safetensors").stat().st_size},
+                hashes={
+                    "adapter": sha256_file(source / "adapter" / "adapters.safetensors"),
+                    "dataset": sha256_file(selected_manifest),
+                    "evaluation": sha256_file(bfcl_contract.path("evaluation.json")),
+                    "predictions": sha256_file(bfcl_contract.path("predictions.jsonl")),
+                },
+                requirements={"tokenizer_hash": bool(manifest.get("hashes", {}).get("tokenizer"))},
+            )
+            results["bfcl"] = bfcl_contract.run_dir.name
+        except Exception as exc:
+            write_json(
+                target,
+                {
+                    "lock_sha256": lock["content_sha256"],
+                    "candidate": candidate,
+                    "official": not replica,
+                    "replica": replica,
+                    "status": "failed",
+                    "error_category": type(exc).__name__,
+                },
+            )
+            raise
+        write_json(
+            target,
+            {
+                "lock_sha256": lock["content_sha256"],
+                "candidate": candidate,
+                "official": not replica,
+                "replica": replica,
+                "official_result": official.name if replica else None,
+                "official_result_sha256": sha256_file(official) if replica else None,
+                "datasets": results,
+                "status": "completed",
+            },
+        )
+        typer.echo(str(target))
     except Exception as exc:
         _fail(exc)
 

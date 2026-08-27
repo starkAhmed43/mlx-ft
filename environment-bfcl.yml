@@ -6,3 +6,4 @@ dependencies:
   - pip
   - pip:
       - bfcl-eval==2026.3.23
+      - soundfile

@@ -7,7 +7,6 @@ import importlib.metadata
 import importlib.resources
 import json
 import os
-import shutil
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -18,6 +17,32 @@ from .data import normalize_schema
 BFCL_VERSION = "2026.3.23"
 BFCL_COMMIT = "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8"
 BFCL_CATEGORIES = ("simple_python", "irrelevance")
+
+
+def bfcl_preflight(environment: str = "mlx-ft-bfcl") -> dict[str, str]:
+    """Verify the dedicated pinned environment without importing it locally."""
+    command = [
+        "conda",
+        "run",
+        "-n",
+        environment,
+        "python",
+        "-c",
+        (
+            "import importlib.metadata as m, subprocess; "
+            f"assert m.version('bfcl-eval') == '{BFCL_VERSION}'; "
+            "subprocess.run(['bfcl', '--help'], check=True, capture_output=True); "
+            "print(m.version('bfcl-eval'))"
+        ),
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("BFCL preflight failed in the dedicated Conda environment") from exc
+    installed = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    if installed != BFCL_VERSION:
+        raise RuntimeError("BFCL preflight did not report the pinned version")
+    return {"environment": environment, "bfcl_version": installed, "source_commit": BFCL_COMMIT}
 
 
 def _case_hash(row: dict[str, Any]) -> str:
@@ -254,11 +279,22 @@ def build_bfcl_eval_commands(
 def evaluate_bfcl(
     run_dir: str | Path, *, project_root: str | Path | None = None, partial_eval: bool = True
 ) -> list[subprocess.CompletedProcess[str]]:
-    """Invoke official BFCL evaluation only when its optional package is installed."""
+    """Invoke the pinned BFCL evaluator in its dedicated Conda environment."""
     run_path = Path(run_dir)
     root = Path(project_root or run_path).resolve()
     if not run_path.is_absolute():
         run_path = root / "runs" / run_path
+    from .study import load_final_lock
+
+    lock = load_final_lock(root)
+    parent = run_path.name.removesuffix("-bfcl")
+    try:
+        run_manifest = json.loads((run_path / "manifest.json").read_text(encoding="utf-8"))
+        parent = str((run_manifest.get("config") or {}).get("parent_run", parent))
+    except OSError, json.JSONDecodeError:
+        pass
+    if parent not in lock["candidates"]:
+        raise ValueError("BFCL evaluation requires an exactly selected final candidate")
     manifest_path = run_path / "bfcl.manifest.json"
     if not manifest_path.exists():
         manifest_path = root / "data" / "bfcl.manifest.json"
@@ -298,7 +334,7 @@ def evaluate_bfcl(
         if category in by_category:
             by_category[category].append(row)
     for category, category_rows in by_category.items():
-        target = result_root / f"BFCL_v3_{category}_result.json"
+        target = result_root / f"BFCL_v4_{category}_result.json"
         staged: list[dict[str, Any]] = []
         for row in category_rows:
             one = {"id": row["id"], "result": row.get("prediction", row.get("result", ""))}
@@ -318,8 +354,8 @@ def evaluate_bfcl(
         partial_eval=partial_eval,
         executable="bfcl",
     )
-    if shutil.which("bfcl") is None:
-        commands = [["conda", "run", "-n", "mlx-ft-bfcl", *command] for command in commands]
+    bfcl_preflight()
+    commands = [["conda", "run", "-n", "mlx-ft-bfcl", *command] for command in commands]
     try:
         return [
             subprocess.run(command, cwd=root, env=env, check=True, capture_output=True, text=True)

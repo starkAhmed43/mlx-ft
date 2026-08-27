@@ -8,12 +8,20 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .artifacts import RunContract, append_system_metric, update_manifest, write_status
+from .artifacts import (
+    RunContract,
+    append_system_metric,
+    sanitize_persisted_value,
+    summarize_system_samples,
+    update_manifest,
+    write_status,
+)
 from .storage import exclusive_project_lock, process_metrics
 
 
@@ -85,10 +93,43 @@ def classify_probe_safety(
 
 
 def _request_path(run: RunContract, request: dict[str, Any]) -> Path:
-    path = run.path("worker.request.json")
+    """Write a short-lived worker request without retaining private paths."""
     request = {**request, "result_path": str(run.path("worker.result.json"))}
-    path.write_text(json.dumps(request, sort_keys=True) + "\n", encoding="utf-8")
+    # Keep a sanitized audit copy. The executable request is removed after the
+    # child exits because it can contain absolute input paths.
+    run.path("worker.request.json").write_text(
+        json.dumps(sanitize_persisted_value(request, run.root), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix=".worker-request-",
+        dir=run.run_dir,
+        delete=False,
+        encoding="utf-8",
+    )
+    with handle:
+        handle.write(json.dumps(request, sort_keys=True) + "\n")
+    path = Path(handle.name)
     return path
+
+
+def _stop_process(process: subprocess.Popen[bytes], *, timeout: float = 10.0) -> int:
+    """Terminate a child, then force-kill it if it ignores SIGTERM."""
+    process.send_signal(signal.SIGTERM)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait(timeout=timeout)
+
+
+def _start_safe_log(run: RunContract) -> None:
+    """Record that child output was withheld from persisted artifacts."""
+    path = run.path("train.log")
+    if not path.exists():
+        path.write_text("Child process output is not retained.\n", encoding="utf-8")
 
 
 def run_isolated(
@@ -102,7 +143,7 @@ def run_isolated(
     root = run.root
     request_path = _request_path(run, request)
     command = [sys.executable, "-m", "ftlab.worker", "--request", str(request_path)]
-    update_manifest(run, command=command, worker_started_at=time.time())
+    update_manifest(run, worker_command=command, worker_started_at=time.time())
     environment = os.environ.copy()
     environment.setdefault("PYTHONUNBUFFERED", "1")
     started = time.monotonic()
@@ -111,29 +152,30 @@ def run_isolated(
     returncode: int | None = 1
     error: str | None = None
     result_payload: dict[str, Any] | None = None
+    sample_rows: list[dict[str, Any]] = []
     try:
         with exclusive_project_lock(root):
-            with run.path("train.log").open("ab") as log:
-                process = subprocess.Popen(
-                    command,
-                    cwd=root,
-                    env=environment,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
-                while True:
-                    returncode = process.poll()
-                    row = process_metrics(process.pid, root)
-                    append_system_metric(run, row)
-                    samples += 1
-                    if returncode is not None:
-                        break
-                    if timeout is not None and time.monotonic() - started >= timeout:
-                        process.terminate()
-                        error = "worker timed out"
-                        returncode = process.wait()
-                        break
-                    time.sleep(max(0.0, interval))
+            _start_safe_log(run)
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            while True:
+                returncode = process.poll()
+                row = process_metrics(process.pid, root)
+                append_system_metric(run, row)
+                sample_rows.append(row)
+                samples += 1
+                if returncode is not None:
+                    break
+                if timeout is not None and time.monotonic() - started >= timeout:
+                    error = "worker timed out"
+                    returncode = _stop_process(process)
+                    break
+                time.sleep(max(0.0, interval))
         result_path = run.path("worker.result.json")
         if result_path.exists():
             result_payload = json.loads(result_path.read_text(encoding="utf-8"))
@@ -159,6 +201,7 @@ def run_isolated(
                 signal=-returncode if returncode is not None and returncode < 0 else None,
             )
         update_manifest(run, worker_finished_at=time.time())
+        update_manifest(run, system_summary=summarize_system_samples(sample_rows))
         final_code = returncode if returncode is not None else 1
         return RunnerResult(
             returncode=final_code,
@@ -171,8 +214,7 @@ def run_isolated(
     except BaseException as exc:
         error = str(exc)
         if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+            _stop_process(process)
         write_status(
             run,
             "failed",
@@ -181,6 +223,8 @@ def run_isolated(
             error=error,
         )
         raise
+    finally:
+        request_path.unlink(missing_ok=True)
 
 
 def run_command_isolated(
@@ -196,25 +240,27 @@ def run_command_isolated(
     samples = 0
     returncode: int | None = 1
     error: str | None = None
+    sample_rows: list[dict[str, Any]] = []
     try:
-        update_manifest(run, command=command, worker_started_at=time.time())
+        update_manifest(run, worker_command=command, worker_started_at=time.time())
         with exclusive_project_lock(run.root):
-            with run.path("train.log").open("ab") as log:
-                process = subprocess.Popen(
-                    command, cwd=run.root, stdout=log, stderr=subprocess.STDOUT
-                )
-                while True:
-                    returncode = process.poll()
-                    append_system_metric(run, process_metrics(process.pid, run.root))
-                    samples += 1
-                    if returncode is not None:
-                        break
-                    if timeout is not None and time.monotonic() - started >= timeout:
-                        process.kill()
-                        error = "command timed out"
-                        returncode = process.wait()
-                        break
-                    time.sleep(max(interval, 0.0))
+            _start_safe_log(run)
+            process = subprocess.Popen(
+                command, cwd=run.root, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            )
+            while True:
+                returncode = process.poll()
+                row = process_metrics(process.pid, run.root)
+                append_system_metric(run, row)
+                sample_rows.append(row)
+                samples += 1
+                if returncode is not None:
+                    break
+                if timeout is not None and time.monotonic() - started >= timeout:
+                    error = "command timed out"
+                    returncode = _stop_process(process)
+                    break
+                time.sleep(max(interval, 0.0))
         status = "completed" if returncode == 0 else "failed"
         write_status(
             run,
@@ -224,14 +270,14 @@ def run_command_isolated(
             error=error,
         )
         update_manifest(run, worker_finished_at=time.time())
+        update_manifest(run, system_summary=summarize_system_samples(sample_rows))
         final_code = returncode if returncode is not None else 1
         return RunnerResult(
             final_code, -final_code if final_code < 0 else None, status, None, error, samples
         )
     except BaseException as exc:
         if process is not None and process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            process.wait()
+            _stop_process(process)
         write_status(
             run,
             "failed",
